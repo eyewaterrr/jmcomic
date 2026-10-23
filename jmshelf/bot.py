@@ -22,6 +22,7 @@ HELP = """<b>JMComic 书库</b>
 JM 号：查看详情、入库、收藏。支持 1485198、JM1485198、#JM1485198、禁漫/车号 1485198、全角数字、作品链接
 多个 JM 号（空格、逗号或换行隔开）：批量入库或收藏
 其他文字：按关键词搜索
+/author 作者名：按作者搜索（作品详情里也可以直接点作者）
 
 收藏：作品放进收藏夹就算收藏，会自动入库并生成 PDF 发到精选频道。收藏夹在书架里管理。
 
@@ -50,6 +51,7 @@ class Bot:
         self._searches: dict[int, dict] = {}
         self._multi: dict[int, list[int]] = {}
         self._jm_data: dict[int, dict] = {}
+        self._authors: dict[int, dict] = {}
         self._photos: dict[int, object] = {}
 
     def register(self):
@@ -123,6 +125,11 @@ class Bot:
                 await self._search(event, uid, arg, 1, edit=False)
             else:
                 await event.respond("用法：/search 关键词")
+        elif cmd == "author":
+            if arg:
+                await self._author_search(event, arg)
+            else:
+                await event.respond("用法：/author 作者名")
         elif cmd == "jobs":
             text, buttons = self._jobs_view()
             await event.respond(text, parse_mode="html", buttons=buttons)
@@ -193,14 +200,41 @@ class Bot:
             await event.respond(text, parse_mode="html", buttons=rows)
 
     @staticmethod
-    def _number_rows(jm_ids: list[int]) -> list:
-        numbers = [Button.inline(str(i), f"a:{jm_id}") for i, jm_id in enumerate(jm_ids, 1)]
+    def _number_rows(jm_ids: list[int], offset: int = 0) -> list:
+        numbers = [Button.inline(str(offset + i), f"a:{jm_id}") for i, jm_id in enumerate(jm_ids, 1)]
         return [numbers[k:k + 5] for k in range(0, len(numbers), 5)]
+
+    # ---- 按作者搜索：每次 10 条，点“加载更多”再发 10 条 ----
+    async def _author_search(self, event, name: str):
+        key = (max(self._authors) + 1) if self._authors else 1
+        self._authors[key] = {"query": name, "by": "author", "pages": {}, "total": 0, "page_size": 0}
+        for old in sorted(self._authors)[:-30]:  # 只保留最近 30 次作者搜索
+            del self._authors[old]
+        text, rows = await self._author_view(key, 0, more=True)
+        await event.respond(text, parse_mode="html", buttons=rows, link_preview=False)
+
+    async def _author_view(self, key: int, start: int, more: bool):
+        state = self._authors[key]
+        items = await self._search_items(state, start, PER_VIEW)
+        name = esc(state["query"])
+        if not items:
+            return f"没有找到作者“{name}”的作品。", None
+        total = state["total"]
+        archived = self.db.archived_ids([it["jm_id"] for it in items])
+        lines = [f"作者：<b>{name}</b>，共 {total} 本（第 {start + 1}–{start + len(items)} 本）", ""]
+        for i, it in enumerate(items, start + 1):
+            mark = "  [已入库]" if it["jm_id"] in archived else ""
+            lines.append(f"{i}. JM{it['jm_id']}  {esc(clip(it['title'], 60))}{mark}")
+        rows = self._number_rows([it["jm_id"] for it in items], start)
+        if more and start + len(items) < total:
+            rows.append([Button.inline("加载更多", f"am:{key}:{start + len(items)}")])
+        return "\n".join(lines), rows
 
     async def _search_items(self, state, start, count):
         """JM 接口一页条数较多，这里按 10 条一屏切分，并缓存已取过的接口页。"""
+        by = state.get("by", "site")
         if not state["pages"]:
-            first = await self.jm.search(state["query"], 1)
+            first = await self.jm.search(state["query"], 1, by)
             state["pages"][1] = first["items"]
             state["total"] = first["total"]
             state["page_size"] = len(first["items"]) or 1
@@ -210,7 +244,7 @@ class Bot:
         while len(result) < count and index < state["total"]:
             api_page = index // size + 1
             if api_page not in state["pages"]:
-                state["pages"][api_page] = (await self.jm.search(state["query"], api_page))["items"]
+                state["pages"][api_page] = (await self.jm.search(state["query"], api_page, by))["items"]
             items = state["pages"][api_page]
             offset = index - (api_page - 1) * size
             if offset >= len(items):
@@ -428,6 +462,23 @@ class Bot:
                     return
                 await event.answer()
                 await self._search(event, uid, state["query"], int(arg), edit=True)
+            elif kind == "au":
+                jm_id, _, index = arg.partition(":")
+                album = await self._album(int(jm_id))
+                await event.answer()
+                await self._author_search(event, album["authors"][int(index)])
+            elif kind == "am":
+                key, _, start = arg.partition(":")
+                if int(key) not in self._authors:
+                    await event.answer("列表已过期，请重新搜索作者", alert=True)
+                    return
+                start = int(start)
+                # 旧消息按原样重写，只去掉“加载更多”，再发一条新消息放接下来的 10 条
+                text, rows = await self._author_view(int(key), start - PER_VIEW, more=False)
+                await event.edit(text, parse_mode="html", buttons=rows, link_preview=False)
+                await event.answer()
+                text, rows = await self._author_view(int(key), start, more=True)
+                await event.respond(text, parse_mode="html", buttons=rows, link_preview=False)
             elif kind == "ar":
                 status, _ = await self.worker.submit("archive", int(arg), uid)
                 await event.answer("已加入队列" if status == "created" else "已经在队列里了")

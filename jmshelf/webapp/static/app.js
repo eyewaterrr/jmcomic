@@ -286,7 +286,7 @@
         el('div', {},
           el('h2', {}, a.title),
           el('p', { class: 'muted' }, `JM${jm}`),
-          a.authors.length ? el('p', { class: 'muted' }, a.authors.join('、')) : null,
+          a.authors.length ? authorLinks(a.authors) : null,
           a.tags.length ? el('p', { class: 'muted' }, a.tags.join(' · ')) : null)),
       el('div', { class: 'actions' }, readBtn, favBtn),
       el('p', { class: 'muted small' }, member.length ? `收藏夹：${member.join('、')}` : '未收藏', `　PDF：${pdfText}`),
@@ -358,7 +358,26 @@
   const STATE_TEXT = { archived: '已入库', archiving: '入库中', partial: '部分入库' };
   const jmCoverUrl = (jm) => `/jmcover/${jm}?t=${encodeURIComponent(S.token)}`;
 
-  // ---- 搜索（和给 Bot 发消息的功能相同） ----
+  // ---- 搜索（和给 Bot 发消息的功能相同；另可按作者搜索） ----
+  const AUTHOR_STEP = 10;
+  const newSearch = (q = '', by = 'site') =>
+    ({ q, by, mode: '', items: [], page: 0, pages: 0, total: 0, shown: AUTHOR_STEP, scroll: 0, pending: false });
+
+  // 点作者名：跳到搜索页，按作者搜索
+  function searchAuthor(name) {
+    S.search = Object.assign(newSearch(name, 'author'), { pending: true });
+    go('#/search');
+  }
+
+  function authorLinks(authors) {
+    const p = el('p', { class: 'muted' });
+    authors.forEach((name, i) => {
+      if (i) p.append('、');
+      p.append(el('a', { class: 'link', href: '#/search', onclick: (e) => { e.preventDefault(); searchAuthor(name); } }, name));
+    });
+    return p;
+  }
+
   function searchCard(it) {
     return el('a', { class: 'card', href: `#/jm/${it.jmId}`, 'data-jm': it.jmId },
       el('div', { class: 'cover' },
@@ -371,19 +390,39 @@
 
   async function renderSearch() {
     S.tab = 'search';
-    const st = S.search || (S.search = { q: '', mode: '', items: [], page: 0, pages: 0, total: 0, scroll: 0 });
+    const st = S.search || (S.search = newSearch());
     let loading = false;
 
+    const seg = el('div', { class: 'seg search-seg' });
     const input = el('textarea', { class: 'input search-input', rows: 1, value: st.q });
     const info = el('p', { class: 'muted small search-info' });
     const bulk = el('div', { class: 'chips bulk' });
     const grid = el('div', { class: 'grid' });
+    const moreBtn = el('button', { class: 'secondary more-btn', onclick: () => showMore() }, '加载更多');
     const more = el('p', { class: 'notice small' });
+
+    const isAuthor = () => st.mode === 'author';
+    const hasMore = () => (isAuthor() ? st.shown < st.items.length || st.page < st.pages : st.page < st.pages);
+    const visible = () => (isAuthor() ? st.items.slice(0, st.shown) : st.items);
+
+    const drawSeg = () => seg.replaceChildren(...[['site', '关键词'], ['author', '作者']].map(([key, label]) =>
+      el('button', {
+        class: key === st.by ? 'on' : '',
+        onclick: () => {
+          if (st.by === key) return;
+          st.by = key;
+          drawSeg();
+          if (input.value.trim()) search(input.value);
+        },
+      }, label)));
 
     const drawInfo = () => {
       if (!st.mode) info.textContent = '';
-      else info.textContent = st.mode === 'ids' ? `识别到 ${st.items.length} 个 JM 号` : `“${st.q}”共 ${st.total} 条`;
+      else if (st.mode === 'ids') info.textContent = `识别到 ${st.items.length} 个 JM 号`;
+      else if (isAuthor()) info.textContent = `作者“${st.q}”共 ${st.total} 本`;
+      else info.textContent = `“${st.q}”共 ${st.total} 条`;
       info.hidden = !info.textContent;
+
       bulk.replaceChildren();
       if (st.mode === 'ids' && st.items.length > 1) {
         const todo = st.items.filter((i) => i.state === 'none' || i.state === 'partial').map((i) => i.jmId);
@@ -391,10 +430,13 @@
         bulk.append(el('button', { class: 'chip', onclick: () => bulkAction('favorite', st.items.map((i) => i.jmId)) }, '全部收藏'));
       }
       bulk.hidden = !bulk.childElementCount;
-      more.hidden = !st.mode || !st.items.length;
-      more.textContent = st.mode === 'search' && st.page < st.pages ? '继续下滑加载更多' : '没有更多了';
+
+      const shown = !!st.mode && st.items.length > 0;
+      moreBtn.hidden = !(shown && isAuthor() && hasMore());
+      more.hidden = !shown || (isAuthor() && hasMore());
+      more.textContent = st.mode === 'search' && hasMore() ? '继续下滑加载更多' : '没有更多了';
     };
-    const drawAll = () => { grid.replaceChildren(...st.items.map(searchCard)); drawInfo(); };
+    const drawAll = () => { grid.replaceChildren(...visible().map(searchCard)); drawInfo(); };
 
     // 多个 JM 号时先列出号码，再逐个补上标题
     const fillTitles = async () => {
@@ -411,17 +453,19 @@
       }
     };
 
+    const query = (page) => `/api/jm/search?q=${encodeURIComponent(st.q)}&page=${page}&by=${st.by}`;
+
     const search = async (q) => {
       q = q.trim();
       if (!q || loading) return;
       loading = true;
       input.blur();
-      Object.assign(st, { q, mode: '', items: [], page: 0, pages: 0, total: 0 });
+      Object.assign(st, { q, mode: '', items: [], page: 0, pages: 0, total: 0, shown: AUTHOR_STEP, pending: false });
       drawAll();
       info.textContent = '搜索中…';
       info.hidden = false;
       try {
-        const d = await api(`/api/jm/search?q=${encodeURIComponent(q)}&page=1`);
+        const d = await api(query(1));
         Object.assign(st, { mode: d.mode, items: d.items, page: d.page, pages: d.pages, total: d.total });
         drawAll();
         window.scrollTo(0, 0);
@@ -433,21 +477,47 @@
       loading = false;
     };
 
+    // 取下一页接口结果（每页 80 条），去重后追加
+    const fetchNext = async () => {
+      const d = await api(query(st.page + 1));
+      const seen = new Set(st.items.map((i) => i.jmId));
+      const add = d.items.filter((i) => !seen.has(i.jmId));
+      st.items.push(...add);
+      st.page = d.page;
+      return add;
+    };
+
+    // 关键词：下滑自动加载
     const loadMore = async () => {
       if (loading || st.mode !== 'search' || st.page >= st.pages) return;
       loading = true;
       more.textContent = '加载中…';
       try {
-        const d = await api(`/api/jm/search?q=${encodeURIComponent(st.q)}&page=${st.page + 1}`);
-        const seen = new Set(st.items.map((i) => i.jmId));
-        const add = d.items.filter((i) => !seen.has(i.jmId));
-        st.items.push(...add);
-        st.page = d.page;
-        grid.append(...add.map(searchCard));
+        grid.append(...(await fetchNext()).map(searchCard));
       } catch (e) {
         toast(e.message);
       }
       loading = false;
+      drawInfo();
+    };
+
+    // 作者：每次多显示 10 本
+    const showMore = async () => {
+      if (loading) return;
+      loading = true;
+      moreBtn.disabled = true;
+      moreBtn.textContent = '加载中…';
+      try {
+        if (st.shown + AUTHOR_STEP > st.items.length && st.page < st.pages) await fetchNext();
+        const before = st.shown;
+        st.shown = Math.min(st.shown + AUTHOR_STEP, st.items.length);
+        grid.append(...st.items.slice(before, st.shown).map(searchCard));
+      } catch (e) {
+        toast(e.message);
+      }
+      loading = false;
+      moreBtn.disabled = false;
+      moreBtn.textContent = '加载更多';
       drawInfo();
     };
 
@@ -456,7 +526,7 @@
         const r = await api(`/api/jm/${kind}`, { jmIds });
         if (kind === 'archive') toast(r.queued ? `已加入入库队列 ${r.queued} 本，进度见“任务”` : '都已经入库或正在入库');
         else toast('已全部收藏，入库和 PDF 进度见“任务”');
-        const d = await api(`/api/jm/search?q=${encodeURIComponent(st.q)}&page=1`);
+        const d = await api(query(1));
         const byId = new Map(d.items.map((i) => [i.jmId, i]));
         st.items.forEach((it) => Object.assign(it, byId.get(it.jmId) || {}, { title: it.title, author: it.author }));
         drawAll();
@@ -468,11 +538,13 @@
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); search(input.value); }
     });
-    app.replaceChildren(tabsBar('search'),
+    drawSeg();
+    app.replaceChildren(tabsBar('search'), seg,
       el('div', { class: 'searchbar' }, input, el('button', { class: 'primary small', onclick: () => search(input.value) }, '搜索')),
-      info, bulk, grid, more);
+      info, bulk, grid, moreBtn, more);
     drawAll();
-    if (st.items.length) window.scrollTo(0, st.scroll);
+    if (st.pending) search(st.q);
+    else if (st.items.length) window.scrollTo(0, st.scroll);
     else setTimeout(() => input.focus(), 50);
 
     const io = new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) loadMore(); },
@@ -526,7 +598,7 @@
         el('div', {},
           el('h2', {}, a.title),
           el('p', { class: 'muted' }, `JM${jm}`),
-          a.authors.length ? el('p', { class: 'muted' }, a.authors.join('、')) : null,
+          a.authors.length ? authorLinks(a.authors) : null,
           a.works.length ? el('p', { class: 'muted' }, a.works.join('、')) : null,
           el('p', { class: 'muted' }, `${a.chapters.length} 章 · ${a.pageCount || '-'} 页`))),
       a.tags.length ? el('p', { class: 'muted small' }, a.tags.join(' · ')) : null,

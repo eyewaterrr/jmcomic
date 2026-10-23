@@ -22,9 +22,11 @@ class JM:
             self._client = jmcomic.JmOption.construct({"client": {"impl": "api"}}).new_jm_client()
         return self._client
 
-    def _search(self, query: str, page: int) -> dict:
+    def _search(self, query: str, page: int, by: str = "site") -> dict:
         with self._lock:
-            result = self._cl().search_site(search_query=query, page=page)
+            client = self._cl()
+            search = client.search_author if by == "author" else client.search_site
+            result = search(search_query=query, page=page)
         items = [{"jm_id": int(aid), "title": info.get("name", ""), "author": info.get("author", "")}
                  for aid, info in result.content]
         return {"total": int(result.total), "pages": result.page_count, "items": items}
@@ -118,8 +120,9 @@ class JM:
     async def push_favorites(self, username: str, password: str, jm_ids: list[int]) -> dict:
         return await asyncio.to_thread(lambda: self.push_with_client(self._login(username, password), jm_ids))
 
-    async def search(self, query: str, page: int = 1) -> dict:
-        return await asyncio.to_thread(self._search, query, page)
+    async def search(self, query: str, page: int = 1, by: str = "site") -> dict:
+        """by="site" 按关键词搜索，by="author" 按作者搜索（模糊匹配），每页 80 条。"""
+        return await asyncio.to_thread(self._search, query, page, by)
 
     async def album(self, jm_id: int, fresh: bool = False) -> dict:
         """作品详情，缓存 10 分钟（Bot 和书架共用）；入库时用 fresh=True 取最新章节。"""

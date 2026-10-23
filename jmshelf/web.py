@@ -435,13 +435,14 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
         return result
 
     @app.get("/api/jm/search")
-    async def api_jm_search(request: Request, q: str = "", page: int = 1):
-        """和给 Bot 发消息一样：识别出 JM 号就列出这些作品，否则按关键词搜索（每页 80 条）。"""
+    async def api_jm_search(request: Request, q: str = "", page: int = 1, by: str = "site"):
+        """和给 Bot 发消息一样：识别出 JM 号就列出这些作品，否则按关键词搜索；by=author 按作者搜索。每页 80 条。"""
         uid = auth(request)
         q = q.strip()
+        by = "author" if by == "author" else "site"
         if not q:
             raise HTTPException(400, "请输入关键词或 JM 号")
-        found = ids.extract(q)
+        found = ids.extract(q) if by == "site" else []
         if found:
             jm_ids = []
             for kind, number in found:
@@ -454,13 +455,13 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
             items = [{"jmId": i, "title": title_of(i), "author": ""} for i in jm_ids]
             return {"mode": "ids", "items": decorate(uid, items), "total": len(items), "page": 1, "pages": 1}
         try:
-            res = await jm.search(q, max(page, 1))
+            res = await jm.search(q, max(page, 1), by)
         except Exception as e:
             log.info("搜索 %s 失败：%s", q, e)
             raise HTTPException(502, "JM 搜索暂时不可用，请稍后再试")
         items = [{"jmId": it["jm_id"], "title": it["title"], "author": it["author"]} for it in res["items"]]
-        return {"mode": "search", "items": decorate(uid, items), "total": res["total"],
-                "page": page, "pages": res["pages"]}
+        return {"mode": by if by == "author" else "search", "items": decorate(uid, items),
+                "total": res["total"], "page": page, "pages": res["pages"]}
 
     @app.get("/api/jm/album/{jm_id}")
     async def api_jm_album(jm_id: int, request: Request, fresh: int = 0):

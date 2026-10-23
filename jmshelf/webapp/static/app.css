@@ -165,3 +165,8 @@ body.reading { background: #000; }
 .pill.running { background: var(--btn); color: var(--btn-text); }
 .pill.failed { color: #d93025; }
 .pill.done { color: var(--hint); }
+
+/* 作者搜索 */
+.search-seg { margin: 10px 12px 0; }
+.link { color: var(--link); }
+.more-btn { display: block; width: calc(100% - 24px); margin: 4px 12px 20px; }
