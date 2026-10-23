@@ -218,7 +218,8 @@ class Worker:
         if not active:
             self.db.finish_batch(batch_id)
             text = "完成。" + text + ("。失败的任务可以发 /jobs 查看原因" if failed else "")
-        await self._edit_or_send(batch["chat_id"], batch["msg_id"], text, None, lambda mid: None)
+        await self._edit_or_send(batch["chat_id"], batch["msg_id"], text, None,
+                                 lambda mid: self.db.set_batch_msg(batch_id, mid))
 
     def _progress(self, job, label: str):
         def callback(done, total):

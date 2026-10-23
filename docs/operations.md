@@ -72,6 +72,13 @@ sudo -u jmcomic bash -c 'set -a; . /etc/jmcomic/jmcomic.env; cd /opt/jmcomic && 
   JM_DATA_DIR=/var/lib/jmcomic venv/bin/python -m jmshelf enqueue archive 123456'
 ```
 
+批量入库多个 JM 号的命令如下。它会自动去重，跳过已经入库或已在队列里的作品，所有任务共用一条进度消息；只入库，不会收藏：
+
+```bash
+sudo -u jmcomic bash -c 'set -a; . /etc/jmcomic/jmcomic.env; cd /opt/jmcomic && \
+  JM_DATA_DIR=/var/lib/jmcomic venv/bin/python -m jmshelf enqueue-batch archive 123456 234567'
+```
+
 把 `archive` 换成 `favorite`，就是生成 PDF。这只生成 PDF，不会把作品放进收藏夹；要收藏，请在 Bot 或书架里操作。
 
 元数据的导出和恢复也用子命令，见第 7 节。

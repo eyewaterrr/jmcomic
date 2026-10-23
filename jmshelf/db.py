@@ -473,6 +473,9 @@ class DB:
         rows = self._all("SELECT kind, status, COUNT(*) AS n FROM jobs WHERE batch_id=? GROUP BY kind, status", batch_id)
         return {(r["kind"], r["status"]): r["n"] for r in rows}
 
+    def set_batch_msg(self, batch_id: int, msg_id: int):
+        self.conn.execute("UPDATE batches SET msg_id=? WHERE id=?", (msg_id, batch_id))
+
     def finish_batch(self, batch_id: int):
         self.conn.execute("UPDATE batches SET finished=1 WHERE id=?", (batch_id,))
 
