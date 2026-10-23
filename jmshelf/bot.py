@@ -7,6 +7,7 @@ import shutil
 import time
 
 from telethon import Button, events, functions, types
+from telethon.errors import MessageNotModifiedError
 
 from . import ids, sync, ui
 from .fmt import clip, esc, size_text, text_table
@@ -457,6 +458,8 @@ class Bot:
                 await event.answer()
             else:
                 await event.answer()
+        except MessageNotModifiedError:
+            await event.answer("已是最新")
         except Exception as e:
             log.exception("处理按钮失败")
             await event.answer(f"出错了：{clip(str(e) or type(e).__name__, 150)}", alert=True)
