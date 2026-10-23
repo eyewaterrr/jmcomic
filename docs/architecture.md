@@ -11,7 +11,7 @@
 | 阅读器 | 复用或改造 jm-view-server | 自研轻量阅读页（Telegram Mini App） | jm-view-server 面向本地文件夹和局域网，带删除、重命名等文件管理功能。要接 Telegram 存储，得先把整本解压到本地。它的阅读交互可以参考。 |
 | Bot 框架 | python-telegram-bot | Telethon 同时负责对话和文件 | 存储层本来就要用 MTProto，这样只需一个库、一个连接。Telethon 默认只走 IPv4，正好避开本机 IPv6 到阿姆斯特丹的故障。 |
 | 内容获取 | jmcomic | jmcomic，只用 API 端，图片线程 2–4 | 本机访问网页端返回 403，API 端正常。1 vCPU 下解码是瓶颈，8 线程不比 4 线程快，内存却多用近一倍。 |
-| Google Drive | google-api-python-client | rclone（只申请 `drive.file` 权限）+ 专用 Google 账号 | rclone 自带断点续传和令牌刷新。个人 Gmail 不能用服务账号（服务账号没有存储配额）。 |
+| 精选收藏 | Google Drive，格式未定 | PDF 存进 Cloudflare R2（boto3） | 用的是同一个 Cloudflare 账号，R2 已经开通。只需一把桶级密钥，没有 OAuth 授权和令牌过期的麻烦，下载流量免费，也不会因为网盘扫描牵连整个 Google 账号。 |
 | 部署 | VPS | VPS 上一个 systemd 服务加若干子进程；对外复用现有 nginx 和 Cloudflare 源站证书 | 只有一个用户，单进程最简单；本机已有“只允许 Cloudflare 回源”的配置。 |
 
 ## 2. 总体结构
@@ -27,8 +27,8 @@
 │ Telethon Bot 会话（MTProto，IPv4）   FastAPI（阅读接口 + 静态页） │
 │ 任务队列（SQLite 持久化，串行执行）  页面读取（区间下载 + 小缓存）│
 └──────┬─────────────────────┬─────────────────────────┬────────┘
-       │ 子进程              │ MTProto                 │ 子进程
-  jmcomic 下载/解码     Telegram 私有频道            rclone → Google Drive
+       │ 子进程              │ MTProto                 │ 子进程 + S3 API
+  jmcomic 下载/解码     Telegram 私有频道            PDF 转换 → Cloudflare R2
   （API 端）            CBZ 归档 + 每日数据库备份      （精选收藏）
 ```
 
@@ -56,9 +56,29 @@ meta: jm=1485198 photo=1485198 ep=1/1 pages=53 sha256=ab12... v=1
 
 第一行给人看；`meta:` 行给程序解析。数据库丢失时，可以靠 `meta:` 行从频道重建索引（见第 7 节）。
 
+**“在线阅读”按钮：** `web_app` 类型的按钮只能用在和 Bot 的私聊里，所以频道帖子改用普通链接按钮，指向 `https://t.me/<bot>?startapp=<photo_id>`。点击后会直接在 Telegram 里打开这一本的阅读页。前提是先在 BotFather 里给 Bot 设置 Main Mini App。
+
+**在 Telegram 客户端里怎么看：**
+
+- **在线阅读：** 点按钮打开 Mini App，从第 1 页或上次读到的位置继续。
+- **下载整本：** 点帖子里的 CBZ 文件。Telegram 不能直接翻看 CBZ，安卓端会下载整本后交给外部漫画 App 打开。
+- 按页读取是服务器读频道文件的方式，不改动频道里的文件，所以以上两种看法都不受影响。
+
+**为什么用频道，而不是和 Bot 的私聊：**
+
+| 方面 | 存在私聊里 | 存在私有频道里 |
+| --- | --- | --- |
+| 内容 | 书和搜索结果、进度消息混在一起 | 只放书，一本一条帖子，像书架 |
+| 误删 | 私聊里删除对话或清空记录时，可以勾选“同时为对方删除”，书库会被一起删掉 | 只有管理员能删；清理私聊不影响书库 |
+| 查找 | 要在对话记录里翻 | 可以在频道内搜 `#JM123456`，“文件”标签页可以按书浏览 |
+| 多人使用 | 每个人的私聊是分开的，要给每人各发一份 | 把人拉进频道即可 |
+| 通知 | 每入库一本都会响 | 频道可以单独静音 |
+
+这两种方式 Bot 都能存、能取，技术上没有区别；分开存放是为了安全和方便浏览。
+
 ## 4. 阅读流程
 
-1. Bot 发出 `web_app` 类型的“在线阅读”按钮，用户点开 Mini App。
+1. 用户点开 Mini App，入口有两个：私聊里 Bot 发的 `web_app` 按钮，或者频道帖子上的链接按钮。
 2. 页面把 Telegram 提供的 `initData` 发给服务器。服务器依次检查：
    - 用 Bot Token 计算的 HMAC 签名正确；
    - `auth_date` 没有过期；
@@ -92,34 +112,42 @@ meta: jm=1485198 photo=1485198 ep=1/1 pages=53 sha256=ab12... v=1
 - 同一时间只跑一个任务，因为服务器只有 1 个 vCPU。
 - 服务重启后，停在 `fetching`、`packing`、`uploading` 的任务会退回 `queued` 重新执行。上传前会先查去重，所以不会重复上传。
 
-## 6. Google Drive 收藏
+## 6. 精选收藏（PDF 存进 Cloudflare R2）
 
-**工具：** 推荐用 rclone，而不是自己调用 Drive API。rclone 自带断点续传、分块上传和令牌刷新，配置好之后上传只需要一条命令：
+**为什么用 R2：**
 
-```bash
-rclone copyto <本地文件> gdrive:JMComic/<文件名>
-```
+- 用的是现有的 Cloudflare 账号，R2 已经开通。
+- 只需一把桶级的 S3 API 密钥，没有 Google OAuth 授权，也没有令牌 7 天过期之类的问题。
+- 下载流量免费。
+- 不存在 Google 扫描网盘后封掉整个 Google 账号（包括 Gmail 等）的风险。
 
-**授权：**
+**费用：**
 
-- 在 Google Cloud 创建自己的 OAuth 客户端，类型选“桌面应用”。
-- 权限只申请 `drive.file`，也就是只能访问本程序自己创建的文件。
-- 把应用的发布状态设为“正式”。处于“测试”状态时，刷新令牌 7 天后就会失效。`drive.file` 属于非敏感权限，正式发布不需要 Google 审核。
-- 不要用服务账号：服务账号没有存储配额，个人 Gmail 用不了。
+- 免费额度每月 10GB 存储，整个账号共享，账号里已有的其他桶也算在内。
+- 超出部分 $0.015/GB/月，100GB 约 $1.5/月。
+- 按实测一本 53 页转成 PDF 约 29–37MB 估算，10GB 约能放 270–340 本（未扣除其他桶的占用）。
 
 **流程：**
 
 1. 从频道把整个 CBZ 下载到临时目录。
-2. 按需转换成 PDF（可选）。
-3. 用 rclone 上传。
-4. 记录 Drive 文件 ID，然后删除临时文件。
+2. 把 WebP 转成 JPEG，再用 img2pdf 原样封装成 PDF（PDF 不能直接嵌入 WebP）。PDF 里写入标题、作者等元数据。
+   - JPEG 质量在 85 到 92 之间选（待定）。
+   - 实测 53 页：质量 85 约 29MB，质量 92 约 37MB（原 WebP 22MB）；耗时 4–5 秒，峰值内存 134–153MB。
+3. 用 boto3 上传到私有桶，大文件会自动分块。
+   - 对象键为 `pdf/{jm_id}/{photo_id}.pdf`。
+   - 下载时显示的文件名通过 `Content-Disposition` 设为作品标题。
+4. 记录对象键和 sha256，然后删除临时文件。
 
-**格式（待确认）：**
+**查看收藏：** R2 是对象存储，不是网盘，没有手机 App 可以直接浏览。所以收藏的作品放在 Mini App 的“收藏”书架里：
 
-- CBZ：保留原图，但需要用漫画阅读器 App 打开。
-- PDF：可以在 Drive 里直接预览，但要先把 WebP 转成 JPEG，体积和画质都会变化。
+- 在线阅读仍然从频道按页读取，速度更快。
+- 需要 PDF 文件时，可以让服务器生成一个 10 分钟内有效的下载链接，或者让 Bot 把 PDF 直接发到私聊。
 
-**账号（待确认）：** 建议用一个专门的 Google 账号。Google 会自动扫描网盘内容，某些成人漫画题材可能被判违规，一旦被封，整个 Google 账号（包括 Gmail 等）都会受影响。如果只想备份、不需要在 Drive 里直接看，也可以用 rclone crypt 加密后再上传。
+**安全：**
+
+- 桶保持私有：不开 r2.dev 公共访问，也不绑定自定义域名。
+- API 密钥只授予这一个桶的对象读写权限。
+- 这个 Cloudflare 账号里还有域名和其他服务，所以这个桶不对外公开任何内容。
 
 ## 7. 数据与备份
 
@@ -132,7 +160,7 @@ SQLite 使用 WAL 模式，表结构如下：
 | `pages` | photo_id、页序号、文件名、数据偏移、长度 |
 | `jobs` | id、类型（archive / drive）、目标、状态、尝试次数、错误、进度消息、时间戳 |
 | `progress` | 用户 ID、jm_id、photo_id、页码、更新时间 |
-| `favorites` | jm_id / photo_id、格式、Drive 文件 ID、上传时间 |
+| `favorites` | jm_id / photo_id、R2 对象键、文件大小、sha256、上传时间 |
 
 **备份：** 每天用 `sqlite3 .backup` 生成一份一致的数据库快照，压缩后作为文件发到同一个私有频道，只保留最近若干份。
 
@@ -143,7 +171,7 @@ SQLite 使用 WAL 模式，表结构如下：
 
 ## 8. 安全
 
-- **密钥不进仓库：** 本仓库是公开的。Token、api_hash、频道 ID、会话文件、数据库、Cookie 密钥和 rclone 配置一律不提交，放在服务器的 `/etc/jmcomic/`（600 权限），或者用 systemd 的 `EnvironmentFile` 加载。
+- **密钥不进仓库：** 本仓库是公开的。Token、api_hash、频道 ID、会话文件、数据库、Cookie 密钥和 R2 API 密钥一律不提交，放在服务器的 `/etc/jmcomic/`（600 权限），或者用 systemd 的 `EnvironmentFile` 加载。
 - **白名单：** 配置文件里列出允许使用的 Telegram 用户 ID，Bot 不回应其他人。
 - **Web 访问：**
   - 服务只监听 127.0.0.1；nginx 沿用现有规则，只放行 Cloudflare 回源。
@@ -185,7 +213,7 @@ SQLite 使用 WAL 模式，表结构如下：
 | 项目 | 做法 |
 | --- | --- |
 | 代码 | 开发目录 `~/projects/jmcomic`，部署到 `/opt/jmcomic`，用独立的 venv |
-| 依赖 | telethon、jmcomic、fastapi、uvicorn；rclone 用官方二进制 |
+| 依赖 | telethon、jmcomic、fastapi、uvicorn、img2pdf、boto3 |
 | systemd | `jmcomic.service` 运行主服务；每日备份可以在主服务里定时执行 |
 | nginx | 新建一个站点，参照现有站点的写法：源站证书 + 只放行 Cloudflare 回源 |
 | DNS | 在 Cloudflare 新增子域名，开启代理 |
