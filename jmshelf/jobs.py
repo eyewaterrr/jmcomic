@@ -61,6 +61,7 @@ class Worker:
         self._last_status: dict[int, float] = {}
         self._last_batch: dict[int, float] = {}
         self._push_lock = asyncio.Lock()
+        self.live: dict[int, dict] = {}  # 任务 ID → {"percent", "text"}，阅读页的进度条用
 
     # ---- 提交 ----
     async def submit(self, kind: str, jm_id: int, user_id: int, batch_id: int | None = None) -> tuple[str, int]:
@@ -217,6 +218,7 @@ class Worker:
                 self.db.update_job(job["id"], status="failed", error=reason)
                 await self._status(job, f"失败：{esc(reason)}", force=True)
         finally:
+            self.live.pop(job["id"], None)
             shutil.rmtree(workdir, ignore_errors=True)
 
     async def _status(self, job, text: str, force: bool = False, buttons=None):
@@ -271,12 +273,37 @@ class Worker:
         await self._edit_or_send(batch["chat_id"], batch["msg_id"], text, None,
                                  lambda mid: self.db.set_batch_msg(batch_id, mid))
 
-    def _progress(self, job, label: str):
+    def _progress(self, job, label: str, span: tuple[float, float] | None = None):
+        """上传进度回调：更新私聊进度消息；给了 span（起点, 终点，0–1）时同时更新进度条。"""
         def callback(done, total):
+            frac = done / max(total, 1)
+            if span:
+                self._set_live(job, span[0] + (span[1] - span[0]) * frac, f"{label}上传 {frac * 100:.0f}%")
             if time.monotonic() - self._last_status.get(job["id"], 0) >= STATUS_INTERVAL:
                 asyncio.get_running_loop().create_task(
-                    self._status(job, f"{label}上传 {done * 100 // max(total, 1)}%（{size_text(total)}）"))
+                    self._status(job, f"{label}上传 {frac * 100:.0f}%（{size_text(total)}）"))
         return callback
+
+    def _set_live(self, job, fraction: float, text: str):
+        self.live[job["id"]] = {"percent": max(0, min(100, round(fraction * 100))), "text": text}
+
+    def progress_for(self, kind: str, jm_id: int) -> dict | None:
+        """某作品进行中的任务进度：正在跑的给百分比，排队中的给前面还有几个任务。"""
+        job = self.db.active_job(kind, jm_id)
+        if job is None:
+            return None
+        if job["status"] == "running":
+            return dict(self.live.get(job["id"], {"percent": 0, "text": "准备中"}), queued=False)
+        ahead = self.db.jobs_ahead(job["id"])
+        return {"percent": 0, "text": f"排队中，前面还有 {ahead} 个任务" if ahead else "排队中", "queued": True}
+
+    async def _watch_download(self, job, img_dir: Path, pages: int, base: float, span: float, label: str):
+        """下载在子进程里进行，每秒数一次已下载的图片来估算进度（下载占这一章的 85%）。"""
+        while True:
+            done = len(pack.list_images(img_dir)) if img_dir.exists() else 0
+            frac = min(done / pages, 1) if pages else 0
+            self._set_live(job, base + span * 0.85 * frac, f"{label}下载 {done}/{pages or '?'} 页")
+            await asyncio.sleep(1)
 
     async def _run_module(self, args: list[str], cwd: Path, timeout: int) -> str:
         env = dict(os.environ, PYTHONPATH=str(PACKAGE_ROOT))
@@ -346,18 +373,26 @@ class Worker:
 
     async def _archive(self, job, workdir: Path):
         jm_id = job["jm_id"]
+        self._set_live(job, 0, "获取作品信息")
         await self._status(job, "获取作品信息", force=True)
         album = await self.jm.album(jm_id, fresh=True)
         self.db.upsert_album(album)
         thumb = await self.ensure_cover(jm_id)
         chapters = album["chapters"]
         total = len(chapters)
+        span = 1 / max(total, 1)
         for i, ch in enumerate(chapters, 1):
             if self.db.chapter(ch["photo_id"]):
                 continue
+            base = (i - 1) * span
             label = f"第 {i}/{total} 章，" if total > 1 else ""
             await self._status(job, f"{label}下载图片", force=True)
             img_dir = workdir / str(ch["photo_id"])
+            try:
+                pages_expected = album["page_count"] if total == 1 else await self.jm.photo_pages(ch["photo_id"])
+            except Exception:
+                pages_expected = 0
+            watcher = asyncio.create_task(self._watch_download(job, img_dir, pages_expected, base, span, label))
             try:
                 await self._run_module(
                     ["jmshelf.fetch", str(ch["photo_id"]), str(img_dir), str(self.cfg.image_threads)],
@@ -365,10 +400,13 @@ class Worker:
             except RuntimeError:
                 self._request_update_check()
                 raise
+            finally:
+                watcher.cancel()
             images = pack.list_images(img_dir)
             if not images:
                 raise RuntimeError("没有下载到图片")
 
+            self._set_live(job, base + span * 0.86, f"{label}打包 {len(images)} 页")
             await self._status(job, f"{label}打包 {len(images)} 页", force=True)
             cbz = workdir / f"{ch['photo_id']}.cbz"
             info = pack.comicinfo_xml(album, ch, len(images))
@@ -385,7 +423,7 @@ class Worker:
             msg = await self.storage.send_document(
                 self.storage.channel, cbz, self._caption(album["title"], jm_id, detail),
                 _file_name(name), thumb=thumb, buttons=self._read_button(f"c{ch['photo_id']}"),
-                progress=self._progress(job, label))
+                progress=self._progress(job, label, (base + span * 0.88, base + span)))
             self.db.add_chapter(jm_id, ch["photo_id"], ch["sort"], ch["title"], msg.id, size, sha, pages)
             self.save_meta(jm_id)
             cbz.unlink(missing_ok=True)

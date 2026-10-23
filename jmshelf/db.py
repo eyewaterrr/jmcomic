@@ -468,6 +468,10 @@ class DB:
     def recent_jobs(self, limit: int = 10):
         return self._all("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", limit)
 
+    def jobs_ahead(self, job_id: int) -> int:
+        """排在这个任务前面、还没做完的任务数。"""
+        return self._one("SELECT COUNT(*) AS n FROM jobs WHERE id<? AND status IN ('queued', 'running')", job_id)["n"]
+
     def job_counts(self) -> dict:
         rows = self._all("SELECT status, COUNT(*) AS n FROM jobs WHERE status IN ('queued', 'running') GROUP BY status")
         return {r["status"]: r["n"] for r in rows}

@@ -203,3 +203,21 @@ body.reading { background: #000; }
   background-position: calc(100% - 15px) 15px, calc(100% - 10px) 15px;
   background-size: 5px 5px; background-repeat: no-repeat;
 }
+
+/* 入库进度条 */
+.progress-box { display: flex; flex-direction: column; gap: 6px; }
+.progress-btn {
+  position: relative; overflow: hidden; width: 100%; padding: 12px; border-radius: var(--radius);
+  font-size: 15px; font-weight: 600; background: var(--bg2); color: var(--text);
+}
+.progress-btn:disabled { opacity: 1; cursor: default; }
+.progress-btn .bar {
+  position: absolute; left: 0; top: 0; bottom: 0; width: var(--p, 0%);
+  background: var(--btn); opacity: .35; transition: width .8s ease;
+}
+.progress-btn.queued .bar { width: 100%; opacity: .12; animation: jm-pulse 1.6s ease-in-out infinite; }
+.progress-btn .label { position: relative; }
+.progress-text { margin: 0; }
+@keyframes jm-pulse { 50% { opacity: .28; } }
+.mini-bar { position: relative; height: 3px; margin-top: 6px; border-radius: 2px; overflow: hidden; background: rgba(127, 127, 127, .2); }
+.mini-bar::after { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: var(--p, 0%); background: var(--btn); }

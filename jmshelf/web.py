@@ -500,6 +500,7 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
             "state": state_of(st, len(a["chapters"])), "archivedChapters": st["chapters"],
             "fav": bool(folders), "folders": folders, "inLibrary": db.album(jm_id) is not None,
             "pdf": "done" if st["pdf"] else "running" if st["pdfJob"] else "none",
+            "progress": worker.progress_for("archive", jm_id),
         }
 
     @app.post("/api/jm/archive")
@@ -530,6 +531,7 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
             "status": j["status"], "step": j["step"], "error": j["error"], "attempts": j["attempts"],
             "retryAt": j["run_after"] if j["status"] == "queued" and j["run_after"] > time.time() else 0,
             "updatedAt": j["updated_at"],
+            "percent": worker.live.get(j["id"], {}).get("percent") if j["status"] == "running" else None,
         } for j in db.recent_jobs(40)]
         counts = db.job_counts()
         return {"items": items, "queued": counts.get("queued", 0), "running": counts.get("running", 0)}

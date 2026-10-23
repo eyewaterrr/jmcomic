@@ -135,6 +135,14 @@ class JM:
                     failed.append((jm_id, str(e)[:120]))
         return {"added": added, "skipped": skipped, "failed": failed}
 
+    def _photo_pages(self, photo_id: int) -> int:
+        with self._lock:
+            return len(self._cl().get_photo_detail(str(photo_id), False, False))
+
+    async def photo_pages(self, photo_id: int) -> int:
+        """一章有多少页（入库时用来算下载进度）。"""
+        return await asyncio.to_thread(self._photo_pages, photo_id)
+
     async def photo_album(self, photo_id: int) -> int:
         return await asyncio.to_thread(self._photo_album, photo_id)
 
