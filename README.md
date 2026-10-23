@@ -73,6 +73,33 @@ Telegram 归档与网页阅读是两个独立能力，需要本项目负责连�
 
 首期不开发独立安卓客户端，不引入 AI 推荐、复杂多租户或多平台聊天接入。先打通个人使用的完整流程，再按实际需求扩展。
 
-## 相关项目
+## 七、参考项目与官方文档
 
-内容获取拟复用 [JMComic-Crawler-Python](https://github.com/hect0x7/JMComic-Crawler-Python)；阅读能力拟参考 [jm-view-server](https://github.com/hect0x7/jm-view-server)。本仓库是独立的业务集成项目，并非上述项目的官方版本。
+以下链接按用途分类，供后续选型和开发参考。**列为参考不代表已经集成，也不代表相关项目与本仓库存在官方合作关系。**
+
+### 核心项目与可复用组件
+
+| 项目 | 仓库地址 | 参考用途 |
+| --- | --- | --- |
+| **JMComic-Crawler-Python** | [hect0x7/JMComic-Crawler-Python](https://github.com/hect0x7/JMComic-Crawler-Python) | 原始内容获取核心：搜索、详情、下载与解码，计划直接依赖并跟踪上游更新。 |
+| **jm-view-server** | [hect0x7/jm-view-server](https://github.com/hect0x7/jm-view-server) | 网页漫画阅读、移动端适配、阅读进度；需要额外开发 Telegram 归档与本地阅读缓存之间的桥接。 |
+| **python-telegram-bot** | [python-telegram-bot/python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) | Python 侧 Telegram 机器人开发参考，包括消息交互与按钮处理。 |
+| **Telegram Bot API Server** | [tdlib/telegram-bot-api](https://github.com/tdlib/telegram-bot-api) | 官方开源的自托管 Bot API 服务；优先评估复用现有服务来传输和管理频道归档。 |
+| **Google API Python Client** | [googleapis/google-api-python-client](https://github.com/googleapis/google-api-python-client) | Google Drive API 的 Python 客户端参考，用于授权后上传精选收藏。 |
+
+### 业务设计与后续扩展参考
+
+| 项目 | 仓库地址 | 值得借鉴的内容 |
+| --- | --- | --- |
+| **JM-Cosmos II** | [GEMILUXVII/astrbot_plugin_jm_cosmos](https://github.com/GEMILUXVII/astrbot_plugin_jm_cosmos) | 聊天机器人内的漫画搜索、打包、发送、权限管理和任务通知。 |
+| **JM-PDF-plugin** | [AmethystTim/JM-PDF-plugin](https://github.com/AmethystTim/JM-PDF-plugin) | PDF 生成、缓存、按章节下载与消息交互。 |
+| **jmcomic-ai** | [hect0x7/jmcomic-ai](https://github.com/hect0x7/jmcomic-ai) | 可选的 MCP / Agent Skills 扩展；不属于首期开发范围。 |
+
+### 官方接口与使用文档
+
+- [JMComic-Crawler-Python 使用文档](https://jmcomic.readthedocs.io/zh-cn/latest/)：上游库接口和配置。
+- [Telegram Bot API](https://core.telegram.org/bots/api)：机器人消息、文件及频道操作接口。
+- [Telegram Mini Apps](https://core.telegram.org/bots/webapps)：Telegram 内嵌网页应用的入口、交互及身份验证。
+- [Google Drive API](https://developers.google.com/workspace/drive/api/guides/about-sdk)：云端文件操作、授权与上传相关文档。
+
+**选型原则：** 优先复用成熟上游组件，新增代码主要承担 Telegram 云存储桥接、书库索引、在线阅读接入及 Google Drive 收藏。首期不引入不必要的 AI Agent 或多平台机器人功能。
