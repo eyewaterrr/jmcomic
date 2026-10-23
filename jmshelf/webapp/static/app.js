@@ -374,10 +374,7 @@
     const st = S.search || (S.search = { q: '', mode: '', items: [], page: 0, pages: 0, total: 0, scroll: 0 });
     let loading = false;
 
-    const input = el('textarea', {
-      class: 'input search-input', rows: 1, value: st.q,
-      placeholder: '关键词、JM 号或作品链接，可一次粘贴多个号码',
-    });
+    const input = el('textarea', { class: 'input search-input', rows: 1, value: st.q });
     const info = el('p', { class: 'muted small search-info' });
     const bulk = el('div', { class: 'chips bulk' });
     const grid = el('div', { class: 'grid' });
