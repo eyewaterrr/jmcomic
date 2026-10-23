@@ -7,7 +7,8 @@
   const tg = window.Telegram && window.Telegram.WebApp;
   const app = document.getElementById('app');
   const toastEl = document.getElementById('toast');
-  const S = { token: '', user: null, cleanup: null, parent: null, tab: 'library', search: null };
+  const S = { token: '', user: null, cleanup: null, parent: null, tab: 'library', search: null,
+    search2: null, pendingSearch: null, ui2: false };
 
   function el(tag, props = {}, ...children) {
     const node = document.createElement(tag);
@@ -122,7 +123,7 @@
       if (route.view === 'album') await renderAlbum(route.jm);
       else if (route.view === 'reader') await renderReader(route.photo, route.page);
       else if (route.view === 'folders') await renderFolders();
-      else if (route.view === 'search') await renderSearch();
+      else if (route.view === 'search') await (S.ui2 ? renderSearchV2() : renderSearch());
       else if (route.view === 'jobs') await renderJobs();
       else if (route.view === 'jm') await renderJm(route.jm);
       else await renderLibrary();
@@ -351,7 +352,8 @@
   // ---- 顶部标签 ----
   const TABS = [['library', '书架', '#/'], ['search', '搜索', '#/search'], ['jobs', '任务', '#/jobs']];
   function tabsBar(active) {
-    return el('nav', { class: 'tabs' }, TABS.map(([key, label, hash]) =>
+    const tabs = TABS.map(([key, label, hash]) => [key, key === 'search' && S.ui2 ? '搜索·新版' : label, hash]);
+    return el('nav', { class: 'tabs' }, tabs.map(([key, label, hash]) =>
       el('button', { class: key === active ? 'on' : '', onclick: () => { if (key !== active) go(hash); } }, label)));
   }
 
@@ -375,7 +377,7 @@
 
   // 点作者、作品、标签：跳到搜索页按对应方式搜索
   function searchBy(by, value) {
-    S.search = newSearch(value, by);
+    S.pendingSearch = { q: value, by };
     go('#/search');
   }
 
@@ -400,6 +402,10 @@
 
   async function renderSearch() {
     S.tab = 'search';
+    if (S.pendingSearch) {
+      S.search = newSearch(S.pendingSearch.q, S.pendingSearch.by);
+      S.pendingSearch = null;
+    }
     const st = S.search || (S.search = newSearch());
     let loading = false;
 
@@ -503,21 +509,24 @@
       return `/api/jm/search?q=${encodeURIComponent(st.q)}&by=${st.by}&order=${st.order}&time=${st.time}&page=${page}`;
     };
 
+    // 换条件时旧结果先留着并变淡，新结果到了直接替换，不会闪回首页
     const load = async () => {
       loading = true;
-      Object.assign(st, { mode: '', items: [], page: 0, pages: 0, total: 0, shown: STEP, pending: false });
-      drawAll();
+      st.pending = false;
+      grid.classList.add('busy');
+      drawControls();
       info.textContent = '加载中…';
       info.hidden = false;
       try {
         const d = await api(url(1));
-        Object.assign(st, { mode: d.mode, items: d.items, page: d.page, pages: d.pages, total: d.total });
+        Object.assign(st, { mode: d.mode, items: d.items, page: d.page, pages: d.pages, total: d.total, shown: STEP });
         drawAll();
         if (d.mode === 'ids') fillTitles();
       } catch (e) {
         info.textContent = e.message;
         info.hidden = false;
       }
+      grid.classList.remove('busy');
       loading = false;
     };
 
@@ -596,6 +605,185 @@
     drawAll();
     if (st.pending) run(st.q);
     else if (st.items.length) window.scrollTo(0, st.scroll);
+    S.cleanup = () => { st.scroll = window.scrollY; };
+  }
+
+  // ---- 搜索页新版（预览）：页面上始终是一个结果列表 ----
+  // 有输入时是搜索结果，没输入时是分类浏览；排行榜 = 分类浏览 + “今日 / 本周 / 本月 / 历史最热”排序
+  const SORTS = [['mr', '最新'], ['mv_t', '今日最热'], ['mv_w', '本周最热'], ['mv_m', '本月最热'],
+    ['mv', '历史最热'], ['mp', '图片最多'], ['tf', '点赞最多']];
+  const sortParams = (v) => (v.startsWith('mv_') ? `order=mv&time=${v.slice(3)}` : `order=${v}&time=a`);
+
+  async function renderSearchV2() {
+    S.tab = 'search';
+    if (!S.search2) {
+      S.search2 = { q: '', by: 'site', sortQ: 'mr', sortB: 'mv_w', cat: '0',
+        mode: '', items: [], page: 0, pages: 0, total: 0, shown: STEP, scroll: 0, loaded: false };
+    }
+    const st = S.search2;
+    let fresh = !st.loaded;
+    if (S.pendingSearch) {
+      Object.assign(st, { q: S.pendingSearch.q, by: S.pendingSearch.by });
+      S.pendingSearch = null;
+      fresh = true;
+    }
+    let loading = false;
+
+    const pick = (list, value, onChange, cls) => {
+      const sel = el('select', { class: cls }, list.map(([k, label]) => el('option', { value: k, selected: k === value }, label)));
+      sel.addEventListener('change', () => onChange(sel.value));
+      return sel;
+    };
+    const bySel = pick(SEARCH_BY, st.by, (v) => { st.by = v; if (input.value.trim()) run(input.value); }, 'by-select');
+    const input = el('textarea', { class: 'input search-input', rows: 1, value: st.q });
+    const clearBtn = el('button', { class: 'clear-btn', 'aria-label': '清空', onclick: () => { input.value = ''; run(''); } }, '×');
+    const controls = el('div', { class: 'pills' });
+    const info = el('p', { class: 'muted small search-info' });
+    const bulk = el('div', { class: 'chips bulk' });
+    const grid = el('div', { class: 'grid' });
+    const moreBtn = el('button', { class: 'secondary more-btn', onclick: () => showMore() }, '加载更多');
+    const end = el('p', { class: 'notice small' }, '没有更多了');
+    const hasMore = () => st.shown < st.items.length || st.page < st.pages;
+
+    const drawControls = () => {
+      clearBtn.hidden = !input.value && !st.q;
+      controls.replaceChildren();
+      if (!st.q) {
+        controls.append(pick(CATEGORIES.map(([k, label]) => [k, k === '0' ? '全部分类' : label]), st.cat,
+          (v) => { st.cat = v; reload(); }, 'pill-select'));
+      }
+      if (st.mode !== 'ids') {
+        controls.append(st.q
+          ? pick(SORTS, st.sortQ, (v) => { st.sortQ = v; reload(); }, 'pill-select')
+          : pick(SORTS, st.sortB, (v) => { st.sortB = v; reload(); }, 'pill-select'));
+      }
+      controls.hidden = !controls.childElementCount;
+    };
+
+    const drawInfo = () => {
+      let text;
+      if (st.mode === 'ids') text = `识别到 ${st.items.length} 个 JM 号`;
+      else if (st.q) {
+        const by = st.by === 'site' ? '' : `${labelOf(SEARCH_BY, st.by)} `;
+        text = st.total ? `${by}“${st.q}”共 ${st.total} 条` : `${by}“${st.q}”没有找到结果`;
+      } else {
+        text = st.total ? `共 ${st.total} 本` : '暂时没有数据';
+      }
+      info.textContent = st.loaded ? text : '';
+      info.hidden = !info.textContent;
+
+      bulk.replaceChildren();
+      if (st.mode === 'ids' && st.items.length > 1) {
+        const todo = st.items.filter((i) => i.state === 'none' || i.state === 'partial').map((i) => i.jmId);
+        if (todo.length) bulk.append(el('button', { class: 'chip', onclick: () => bulkAction('archive', todo) }, `全部入库（${todo.length} 本）`));
+        bulk.append(el('button', { class: 'chip', onclick: () => bulkAction('favorite', st.items.map((i) => i.jmId)) }, '全部收藏'));
+      }
+      bulk.hidden = !bulk.childElementCount;
+      moreBtn.hidden = !(st.items.length && hasMore());
+      end.hidden = !(st.items.length && !hasMore());
+    };
+    const drawAll = () => {
+      grid.replaceChildren(...st.items.slice(0, st.shown).map(searchCard));
+      drawControls();
+      drawInfo();
+    };
+
+    const url = (page) => (st.q
+      ? `/api/jm/search?q=${encodeURIComponent(st.q)}&by=${st.by}&${sortParams(st.sortQ)}&page=${page}`
+      : `/api/jm/browse?category=${st.cat}&${sortParams(st.sortB)}&page=${page}`);
+
+    const fillTitles = async () => {
+      for (const it of st.items.filter((i) => !i.title)) {
+        try {
+          const a = await api(`/api/jm/album/${it.jmId}`);
+          it.title = a.title;
+          it.author = a.authors.join('、');
+        } catch (e) {
+          it.title = '取不到详情';
+        }
+        const card = grid.querySelector(`[data-jm="${it.jmId}"]`);
+        if (card) card.replaceWith(searchCard(it));
+      }
+    };
+
+    // 换条件时旧结果先变淡，新结果到了再替换
+    const reload = async () => {
+      if (loading) return;
+      loading = true;
+      grid.classList.add('busy');
+      drawControls();
+      info.textContent = '加载中…';
+      info.hidden = false;
+      try {
+        const d = await api(url(1));
+        Object.assign(st, { mode: d.mode, items: d.items, page: d.page, pages: d.pages, total: d.total,
+          shown: STEP, loaded: true });
+        drawAll();
+        window.scrollTo(0, 0);
+        if (d.mode === 'ids') fillTitles();
+      } catch (e) {
+        info.textContent = e.message;
+        info.hidden = false;
+      }
+      grid.classList.remove('busy');
+      loading = false;
+    };
+
+    const run = (q) => {
+      st.q = q.trim();
+      input.blur();
+      reload();
+    };
+
+    const showMore = async () => {
+      if (loading) return;
+      loading = true;
+      moreBtn.disabled = true;
+      moreBtn.textContent = '加载中…';
+      try {
+        if (st.shown + STEP > st.items.length && st.page < st.pages) {
+          const d = await api(url(st.page + 1));
+          const seen = new Set(st.items.map((i) => i.jmId));
+          st.items.push(...d.items.filter((i) => !seen.has(i.jmId)));
+          st.page = d.page;
+        }
+        const before = st.shown;
+        st.shown = Math.min(st.shown + STEP, st.items.length);
+        grid.append(...st.items.slice(before, st.shown).map(searchCard));
+      } catch (e) {
+        toast(e.message);
+      }
+      loading = false;
+      moreBtn.disabled = false;
+      moreBtn.textContent = '加载更多';
+      drawInfo();
+    };
+
+    const bulkAction = async (kind, jmIds) => {
+      try {
+        const r = await api(`/api/jm/${kind}`, { jmIds });
+        if (kind === 'archive') toast(r.queued ? `已加入入库队列 ${r.queued} 本，进度见“任务”` : '都已经入库或正在入库');
+        else toast('已全部收藏，入库和 PDF 进度见“任务”');
+        const d = await api(url(1));
+        const byId = new Map(d.items.map((i) => [i.jmId, i]));
+        st.items.forEach((it) => Object.assign(it, byId.get(it.jmId) || {}, { title: it.title, author: it.author }));
+        drawAll();
+      } catch (e) {
+        toast(e.message);
+      }
+    };
+
+    input.addEventListener('input', () => { clearBtn.hidden = !input.value && !st.q; });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run(input.value); }
+    });
+    app.replaceChildren(tabsBar('search'),
+      el('div', { class: 'searchbar' }, bySel, el('div', { class: 'input-wrap' }, input, clearBtn),
+        el('button', { class: 'primary small', onclick: () => run(input.value) }, '搜索')),
+      controls, info, bulk, grid, moreBtn, end);
+    drawAll();
+    if (fresh) reload();
+    else window.scrollTo(0, st.scroll);
     S.cleanup = () => { st.scroll = window.scrollY; };
   }
 
@@ -867,6 +1055,12 @@
     try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) { /* 旧版客户端 */ }
     if (tg.BackButton) tg.BackButton.onClick(() => go(S.parent || '#/'));
 
+    try {
+      const ui = new URLSearchParams(location.search).get('ui');
+      if (ui) sessionStorage.setItem('jm.ui', ui);
+      S.ui2 = (ui || sessionStorage.getItem('jm.ui')) === '2';
+    } catch (e) { /* 存储不可用时只看网址参数 */ }
+
     let d;
     try {
       d = await login();
@@ -885,7 +1079,7 @@
       let target = '#/';
       if (chapter) target = `#/r/${chapter[1]}`;
       else if (/^\d+$/.test(jm)) target = await continueTarget(Number(jm));
-      else if (params.get('search')) { S.search = newSearch(params.get('search'), by); target = '#/search'; }
+      else if (params.get('search')) { S.pendingSearch = { q: params.get('search'), by }; target = '#/search'; }
       else if (['search', 'jobs'].includes(params.get('tab'))) target = `#/${params.get('tab')}`;
       history.replaceState(null, '', location.pathname + location.search + target);
     }

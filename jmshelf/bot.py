@@ -134,6 +134,11 @@ class Bot:
                 await self._author_search(event, arg)
             else:
                 await event.respond("用法：/author 作者名")
+        elif cmd == "preview":
+            # 新版搜索页预览：只有从这个按钮打开时才用新版，平时打开书架仍是当前版本
+            button = ui.webapp_button(self.cfg, "打开新版搜索页（预览）", "?tab=search&ui=2")
+            await event.respond("新版搜索页预览。平时从“书架”菜单打开的仍是当前版本。",
+                                buttons=[[button]] if button else None)
         elif cmd == "jobs":
             text, buttons = self._jobs_view()
             await event.respond(text, parse_mode="html", buttons=buttons)

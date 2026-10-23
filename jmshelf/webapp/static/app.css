@@ -190,3 +190,16 @@ body.reading { background: #000; }
 .filters .chips, .discover .chips { padding-bottom: 8px; }
 .discover { padding-top: 6px; }
 .discover h3 { font-size: 13px; color: var(--hint); font-weight: 500; margin: 8px 12px 6px; }
+
+.grid.busy { opacity: .45; pointer-events: none; transition: opacity .15s; }
+
+/* 新版搜索页：分类、排序两个下拉 */
+.pills { display: flex; gap: 8px; padding: 2px 12px 0; }
+.pill-select {
+  height: 34px; padding: 0 28px 0 12px; border-radius: 17px; font: inherit; font-size: 13px;
+  border: 0; background-color: var(--bg2); color: var(--text);
+  -webkit-appearance: none; appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 15px) 15px, calc(100% - 10px) 15px;
+  background-size: 5px 5px; background-repeat: no-repeat;
+}
