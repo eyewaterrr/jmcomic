@@ -384,11 +384,9 @@
     const more = el('p', { class: 'notice small' });
 
     const drawInfo = () => {
-      if (!st.mode) {
-        info.textContent = '和给 Bot 发消息一样：关键词就搜索；JM 号、#JM、作品链接、全角数字都能识别；多个号码用空格、逗号或换行隔开。';
-      } else {
-        info.textContent = st.mode === 'ids' ? `识别到 ${st.items.length} 个 JM 号` : `“${st.q}”共 ${st.total} 条`;
-      }
+      if (!st.mode) info.textContent = '';
+      else info.textContent = st.mode === 'ids' ? `识别到 ${st.items.length} 个 JM 号` : `“${st.q}”共 ${st.total} 条`;
+      info.hidden = !info.textContent;
       bulk.replaceChildren();
       if (st.mode === 'ids' && st.items.length > 1) {
         const todo = st.items.filter((i) => i.state === 'none' || i.state === 'partial').map((i) => i.jmId);
@@ -424,6 +422,7 @@
       Object.assign(st, { q, mode: '', items: [], page: 0, pages: 0, total: 0 });
       drawAll();
       info.textContent = '搜索中…';
+      info.hidden = false;
       try {
         const d = await api(`/api/jm/search?q=${encodeURIComponent(q)}&page=1`);
         Object.assign(st, { mode: d.mode, items: d.items, page: d.page, pages: d.pages, total: d.total });
@@ -432,6 +431,7 @@
         if (d.mode === 'ids') fillTitles();
       } catch (e) {
         info.textContent = e.message;
+        info.hidden = false;
       }
       loading = false;
     };
