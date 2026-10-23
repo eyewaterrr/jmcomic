@@ -1,0 +1,9 @@
+[Unit]
+Description=Check and apply jmcomic library updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/jmcomic/bin/jmcomic-update.sh
+TimeoutStartSec=45min

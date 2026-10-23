@@ -1,0 +1,9 @@
+[Unit]
+Description=Run jmcomic update check when the service requests it
+
+[Path]
+PathExists=/var/lib/jmcomic/update-request
+Unit=jmcomic-update.service
+
+[Install]
+WantedBy=multi-user.target
