@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+*.db
+*.db-wal
+*.db-shm
+*.env
+!deploy/jmcomic.env.example
+data/

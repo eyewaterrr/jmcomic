@@ -1,0 +1,32 @@
+[Unit]
+Description=JMComic Telegram library (bot + reader)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jmcomic
+Group=jmcomic
+EnvironmentFile=/etc/jmcomic/jmcomic.env
+Environment=JM_DATA_DIR=/var/lib/jmcomic HOME=/var/lib/jmcomic PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/jmcomic
+ExecStart=/opt/jmcomic/venv/bin/python -m jmshelf
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+# 下载子进程峰值约 300MB，主进程约 150MB，本机可用内存约 1GB
+MemoryHigh=700M
+MemoryMax=900M
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/jmcomic
+
+[Install]
+WantedBy=multi-user.target

@@ -204,10 +204,14 @@ SQLite 使用 WAL 模式，表结构如下：
 
 | 项目 | 做法 |
 | --- | --- |
-| 代码 | 开发目录 `~/projects/jmcomic`，部署到 `/opt/jmcomic`，用独立的 venv |
-| 依赖 | telethon、jmcomic、fastapi、uvicorn、img2pdf |
-| systemd | `jmcomic.service` 运行主服务；每日备份可以在主服务里定时执行 |
-| nginx | 新建一个站点，参照现有站点的写法：源站证书 + 只放行 Cloudflare 回源 |
+| 代码 | 开发目录 `~/projects/jmcomic`；用 `deploy/install.sh` 部署到 `/opt/jmcomic`，使用独立的 venv |
+| 配置 | `/etc/jmcomic/jmcomic.env`，权限 640 |
+| 数据 | `/var/lib/jmcomic` |
+| 依赖 | telethon、cryptg、jmcomic、fastapi、uvicorn、img2pdf，版本固定在 `requirements.txt` |
+| systemd | `jmcomic.service` 以系统用户 `jmcomic` 运行，内存上限 900M；每日备份在主服务里定时执行 |
+| nginx | 用 `deploy/nginx-jmcomic.conf` 生成站点，配源站证书，并且只放行 Cloudflare 回源 |
 | DNS | 在 Cloudflare 新增子域名，开启代理 |
+
+日常操作见 [operations.md](operations.md)。
 
 **注意：** Mini App 页面走的是手机的系统网络，不经过 Telegram 内置的代理。如果手机所在网络需要代理才能访问该域名，要在系统层面（VPN）处理。

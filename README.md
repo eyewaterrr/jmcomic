@@ -2,7 +2,29 @@
 
 以 Telegram 为统一入口，结合服务器端内容获取、在线阅读和 PDF 精选收藏，构建个人使用的云端漫画书库。
 
-> 当前状态：架构规划阶段，尚无代码。已在目标服务器上做过可行性实测（[docs/environment.md](docs/environment.md)），并据此修订了存储和阅读方案（[docs/architecture.md](docs/architecture.md)）；待确认事项和下一步见 [docs/progress.md](docs/progress.md)。本文描述的功能都还没有实现或部署。
+> 当前状态：第一版已部署，正在手机上验收。
+>
+> - 已完成：入库、按页在线阅读、收藏 PDF、用户白名单和每日备份。
+> - 实测数据：[docs/environment.md](docs/environment.md)
+> - 设计：[docs/architecture.md](docs/architecture.md)
+> - 运维：[docs/operations.md](docs/operations.md)
+> - 进度：[docs/progress.md](docs/progress.md)
+
+## 代码结构
+
+| 路径 | 内容 |
+| --- | --- |
+| `jmshelf/__main__.py` | 启动入口：在同一进程里运行 Telethon Bot、任务队列和阅读页服务 |
+| `jmshelf/bot.py` | Bot 私聊：搜索、作品详情、入库、收藏、任务、用户管理 |
+| `jmshelf/jobs.py` | 任务队列：入库、收藏、每日备份 |
+| `jmshelf/tg.py` | 频道存储：并行分块上传、按字节区间读取、并行下载 |
+| `jmshelf/web.py` | 阅读页后端：身份校验、书架接口、按页图片（缓存和预取） |
+| `jmshelf/webapp/` | Mini App 前端 |
+| `jmshelf/fetch.py`、`jmshelf/pdf.py` | 两个子进程：下载图片、生成 PDF |
+| `jmshelf/pack.py` | CBZ 打包和每页偏移 |
+| `jmshelf/db.py` | SQLite 索引 |
+| `deploy/` | systemd 服务、安装脚本、nginx 模板、配置示例 |
+| `tests/` | 单元测试，运行 `python -m pytest` |
 
 ## 一、最终目的
 
