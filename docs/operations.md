@@ -179,3 +179,4 @@ sudo systemctl disable --now jmcomic-update.timer jmcomic-update.path
 1. 运行 `sudo micro /etc/jmcomic/jmcomic.env`，填写 `JM_USERNAME` 和 `JM_PASSWORD`，保存后运行 `sudo systemctl restart jmcomic`。
 2. 在 Bot 里发 `/jmsync`，看过统计后点“开始同步”。
 3. 想每天自动同步，在 `/jmsync` 的消息里打开开关即可。
+4. “反向同步到 JM”的开关也在同一条消息里，默认关闭。打开后，你在这边新收藏的作品会自动加进 JM 账号的默认收藏，只加不删。

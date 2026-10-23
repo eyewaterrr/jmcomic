@@ -47,38 +47,72 @@ class JM:
         return int(photo.album_id)
 
     @staticmethod
-    def _favorites(username: str, password: str) -> dict:
-        """登录 JM 账号，读出全部收藏。返回各收藏夹的作品号，以及不在任何收藏夹里的（未分类）。"""
+    def _login(username: str, password: str):
         client = jmcomic.JmOption.construct({"client": {"impl": "api"}}).new_jm_client()
         client.login(username, password)
+        return client
 
-        def collect(folder_id: str):
-            ids, folders, page = [], [], 1
-            while page <= 500:
-                fav = client.favorite_folder(page=page, folder_id=folder_id)
-                if page == 1:
-                    folders = list(fav.iter_folder_id_name())
-                batch = [int(i) for i in fav.iter_id()]
-                ids += [i for i in batch if i not in ids]
-                if not batch or len(ids) >= int(fav.total):
-                    break
-                page += 1
-            return ids, folders
+    @staticmethod
+    def collect_ids(client, folder_id: str) -> tuple[list[int], list]:
+        """读出某个收藏夹（"0" 表示全部收藏）的作品号，以及账号的收藏夹列表。"""
+        ids, folders, page = [], [], 1
+        while page <= 500:
+            fav = client.favorite_folder(page=page, folder_id=folder_id)
+            if page == 1:
+                folders = list(fav.iter_folder_id_name())
+            batch = [int(i) for i in fav.iter_id()]
+            ids += [i for i in batch if i not in ids]
+            if not batch or len(ids) >= int(fav.total):
+                break
+            page += 1
+        return ids, folders
 
-        everything, folders = collect("0")
+    @classmethod
+    def _favorites(cls, username: str, password: str) -> dict:
+        """登录 JM 账号，读出全部收藏。返回各收藏夹的作品号，以及不在任何收藏夹里的（未分类）。"""
+        client = cls._login(username, password)
+        everything, folders = cls.collect_ids(client, "0")
         result, placed = [], set()
         for fid, name in folders:
-            ids, _ = collect(str(fid))
+            ids, _ = cls.collect_ids(client, str(fid))
             placed.update(ids)
             result.append({"id": str(fid), "name": name, "items": ids})
         rest = [i for i in everything if i not in placed]
         return {"total": len(everything), "folders": result, "uncategorized": rest}
+
+    @classmethod
+    def push_with_client(cls, client, jm_ids: list[int]) -> dict:
+        """把作品加进 JM 收藏（反向同步）。
+
+        JM 移动端的收藏接口是“切换”：对已收藏的作品再调用会先取消再由 jmcomic 回滚，
+        可能打乱它在 JM 收藏夹里的位置。所以先读一遍现有收藏，已收藏的直接跳过。
+        移动端接口不支持指定收藏夹，新加的都进默认收藏。
+        """
+        have = set(cls.collect_ids(client, "0")[0])
+        added, skipped, failed = [], [], []
+        for jm_id in dict.fromkeys(jm_ids):
+            if jm_id in have:
+                skipped.append(jm_id)
+                continue
+            try:
+                client.add_favorite_album(str(jm_id))
+                added.append(jm_id)
+            except Exception as e:
+                if "已自动回滚" in str(e):
+                    # jmcomic 发现其实已经收藏过，已回滚还原，等于已收藏
+                    skipped.append(jm_id)
+                else:
+                    failed.append((jm_id, str(e)[:120]))
+        return {"added": added, "skipped": skipped, "failed": failed}
 
     async def photo_album(self, photo_id: int) -> int:
         return await asyncio.to_thread(self._photo_album, photo_id)
 
     async def favorites(self, username: str, password: str) -> dict:
         return await asyncio.to_thread(self._favorites, username, password)
+
+    async def push_favorites(self, username: str, password: str, jm_ids: list[int]) -> dict:
+        return await asyncio.to_thread(lambda: self.push_with_client(self._login(username, password), jm_ids))
 
     async def search(self, query: str, page: int = 1) -> dict:
         return await asyncio.to_thread(self._search, query, page)

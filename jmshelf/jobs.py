@@ -60,6 +60,7 @@ class Worker:
         self._wake = asyncio.Event()
         self._last_status: dict[int, float] = {}
         self._last_batch: dict[int, float] = {}
+        self._push_lock = asyncio.Lock()
 
     # ---- 提交 ----
     async def submit(self, kind: str, jm_id: int, user_id: int, batch_id: int | None = None) -> tuple[str, int]:
@@ -78,9 +79,38 @@ class Worker:
 
     async def favorite(self, user_id: int, jm_id: int, batch_id: int | None = None) -> str:
         """加入默认收藏夹，并安排后续工作：没入库就先入库，入库完成后自动生成 PDF。"""
+        was = self.db.is_favorited(user_id, jm_id)
         self.db.add_to_folder(self.db.default_folder(user_id), jm_id)
         self.save_meta(jm_id)
+        if not was:
+            self.queue_jm_push(user_id, [jm_id])
         return await self.after_favorite(user_id, jm_id, batch_id)
+
+    def queue_jm_push(self, user_id: int, jm_ids: list[int]):
+        """反向同步：所有者在这边收藏时，也加进 JM 账号的收藏。开关在 /jmsync，默认关闭；只加不删。"""
+        if (user_id != self.cfg.owner_id or not jm_ids or not self.cfg.jm_username
+                or self.db.get_meta("jm_reverse") != "1"):
+            return
+        asyncio.get_running_loop().create_task(self._push_jm(list(jm_ids)))
+
+    async def _push_jm(self, jm_ids: list[int]):
+        async with self._push_lock:
+            try:
+                result = await self.jm.push_favorites(self.cfg.jm_username, self.cfg.jm_password, jm_ids)
+            except Exception as e:
+                result = {"added": [], "skipped": [], "failed": [(i, clip(str(e) or type(e).__name__, 120)) for i in jm_ids]}
+            self.db.set_meta("jm_reverse_last", json.dumps({
+                "at": int(time.time()), "added": len(result["added"]),
+                "skipped": len(result["skipped"]), "failed": len(result["failed"])}))
+            log.info("反向同步到 JM：加入 %s，已在 JM 收藏 %s，失败 %s",
+                     result["added"], result["skipped"], result["failed"])
+            if result["failed"]:
+                lines = [f"JM{i}：{esc(err)}" for i, err in result["failed"][:10]]
+                try:
+                    await self.client.send_message(self.cfg.owner_id, "反向同步到 JM 失败：\n" + "\n".join(lines),
+                                                   parse_mode="html")
+                except Exception:
+                    log.warning("发送反向同步失败通知失败", exc_info=True)
 
     async def after_favorite(self, user_id: int, jm_id: int, batch_id: int | None = None) -> str:
         if not self.db.fully_archived(jm_id):

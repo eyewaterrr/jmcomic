@@ -298,6 +298,7 @@ class Bot:
             return
         if favorite:
             folder = self.db.default_folder(uid)
+            self.worker.queue_jm_push(uid, [j for j in jm_ids if not self.db.is_favorited(uid, j)])
             for jm_id in jm_ids:
                 self.db.add_to_folder(folder, jm_id)
                 self.worker.save_meta(jm_id)
@@ -340,12 +341,28 @@ class Bot:
         last = int(self.db.get_meta("jmsync_at", "0"))
         if last:
             lines.append("上次同步：" + time.strftime("%Y-%m-%d %H:%M", time.localtime(last)))
+        lines += ["", "反向同步：" + self._reverse_state(),
+                  "开启后，你在这边收藏作品时，会自动加进 JM 账号的收藏。只加不删；"
+                  "JM 接口只能放进默认收藏；已经在 JM 收藏里的会跳过。"]
         return "\n".join(lines)
+
+    def _reverse_state(self) -> str:
+        state = "已开启" if self.db.get_meta("jm_reverse") == "1" else "已关闭"
+        try:
+            last = json.loads(self.db.get_meta("jm_reverse_last", "{}"))
+        except ValueError:
+            last = {}
+        if last:
+            when = time.strftime("%m-%d %H:%M", time.localtime(last["at"]))
+            state += f"（最近一次 {when}：加入 {last['added']}，已存在 {last['skipped']}，失败 {last['failed']}）"
+        return state
 
     def _jmsync_buttons(self):
         auto = self.db.get_meta("jmsync_auto") == "1"
+        reverse = self.db.get_meta("jm_reverse") == "1"
         return [[Button.inline("开始同步", "js:go"), Button.inline("取消", "x:0")],
-                [Button.inline("每天自动同步：已开启（点此关闭）" if auto else "每天自动同步：已关闭（点此开启）", "js:auto")]]
+                [Button.inline("每天自动同步：已开启（点此关闭）" if auto else "每天自动同步：已关闭（点此开启）", "js:auto")],
+                [Button.inline("反向同步到 JM：已开启（点此关闭）" if reverse else "反向同步到 JM：已关闭（点此开启）", "js:rev")]]
 
     # ---- 任务 / 用户 / 状态 ----
     def _jobs_view(self):
@@ -399,6 +416,7 @@ class Bot:
         if self.cfg.jm_username:
             auto = "已开启" if self.db.get_meta("jmsync_auto") == "1" else "已关闭"
             lines.append(f"JM 收藏夹同步：已配置账号，每天自动同步{auto}。")
+            lines.append("反向同步到 JM：" + esc(self._reverse_state()) + "。")
         else:
             lines.append("JM 收藏夹同步：未配置账号。")
         return "\n".join(lines)
@@ -465,10 +483,11 @@ class Bot:
             await event.answer(f"出错了：{clip(str(e) or type(e).__name__, 150)}", alert=True)
 
     async def _jmsync_callback(self, event, uid, arg):
-        if arg == "auto":
-            on = self.db.get_meta("jmsync_auto") != "1"
-            self.db.set_meta("jmsync_auto", "1" if on else "0")
-            await event.answer("已开启每天自动同步" if on else "已关闭每天自动同步")
+        if arg in ("auto", "rev"):
+            key, name = ("jmsync_auto", "每天自动同步") if arg == "auto" else ("jm_reverse", "反向同步到 JM")
+            on = self.db.get_meta(key) != "1"
+            self.db.set_meta(key, "1" if on else "0")
+            await event.answer(f"已开启{name}" if on else f"已关闭{name}")
             data = self._jm_data.get(uid)
             if data:
                 await event.edit(self._jmsync_text(data), parse_mode="html", buttons=self._jmsync_buttons())

@@ -269,12 +269,15 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
         uid = auth(request)
         if db.album(jm_id) is None:
             raise HTTPException(404, "书库里没有这本")
+        was = db.is_favorited(uid, jm_id)
         try:
             wanted = {int(x) for x in (await body(request)).get("folderIds", [])}
             db.set_album_folders(uid, jm_id, wanted)
         except (TypeError, ValueError) as e:
             raise HTTPException(400, str(e) or "参数不对")
         worker.save_meta(jm_id)
+        if not was and db.is_favorited(uid, jm_id):
+            worker.queue_jm_push(uid, [jm_id])
         result = await worker.after_favorite(uid, jm_id) if db.is_favorited(uid, jm_id) else "none"
         return {"ok": True, "fav": db.is_favorited(uid, jm_id), "next": result}
 
