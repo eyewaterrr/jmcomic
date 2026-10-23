@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import ids
+from .jm import CATEGORIES, ORDERS, SEARCH_BY, TIMES
 
 log = logging.getLogger(__name__)
 
@@ -435,11 +436,15 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
         return result
 
     @app.get("/api/jm/search")
-    async def api_jm_search(request: Request, q: str = "", page: int = 1, by: str = "site"):
-        """和给 Bot 发消息一样：识别出 JM 号就列出这些作品，否则按关键词搜索；by=author 按作者搜索。每页 80 条。"""
+    async def api_jm_search(request: Request, q: str = "", page: int = 1, by: str = "site",
+                            order: str = "mr", time: str = "a"):
+        """by：site 关键词（能识别 JM 号，和给 Bot 发消息一样）、work 作品、author 作者、tag 标签、actor 角色。
+        order：mr 最新、mv 最多观看、mp 最多图片、tf 最多点赞；time 只对最多观看有效。每页 80 条。"""
         uid = auth(request)
         q = q.strip()
-        by = "author" if by == "author" else "site"
+        by = by if by in SEARCH_BY else "site"
+        order = order if order in ORDERS else "mr"
+        time = time if time in TIMES else "a"
         if not q:
             raise HTTPException(400, "请输入关键词或 JM 号")
         found = ids.extract(q) if by == "site" else []
@@ -455,13 +460,29 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
             items = [{"jmId": i, "title": title_of(i), "author": ""} for i in jm_ids]
             return {"mode": "ids", "items": decorate(uid, items), "total": len(items), "page": 1, "pages": 1}
         try:
-            res = await jm.search(q, max(page, 1), by)
+            res = await jm.search(q, max(page, 1), by, order, time)
         except Exception as e:
             log.info("搜索 %s 失败：%s", q, e)
             raise HTTPException(502, "JM 搜索暂时不可用，请稍后再试")
         items = [{"jmId": it["jm_id"], "title": it["title"], "author": it["author"]} for it in res["items"]]
-        return {"mode": by if by == "author" else "search", "items": decorate(uid, items),
+        return {"mode": "search", "items": decorate(uid, items),
                 "total": res["total"], "page": page, "pages": res["pages"]}
+
+    @app.get("/api/jm/browse")
+    async def api_jm_browse(request: Request, category: str = "0", order: str = "mr", time: str = "a",
+                            page: int = 1):
+        """分类浏览；排行榜用 order=mv 加 time（t 日、w 周、m 月、a 总榜）。"""
+        uid = auth(request)
+        if category not in CATEGORIES or order not in ORDERS or time not in TIMES:
+            raise HTTPException(400, "分类或排序参数不对")
+        try:
+            res = await jm.browse(max(page, 1), category, order, time)
+        except Exception as e:
+            log.info("分类浏览失败：%s", e)
+            raise HTTPException(502, "JM 暂时不可用，请稍后再试")
+        items = [{"jmId": it["jm_id"], "title": it["title"], "author": it["author"]} for it in res["items"]]
+        return {"mode": "browse", "items": decorate(uid, items), "total": res["total"],
+                "page": page, "pages": res["pages"]}
 
     @app.get("/api/jm/album/{jm_id}")
     async def api_jm_album(jm_id: int, request: Request, fresh: int = 0):

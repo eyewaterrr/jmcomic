@@ -10,6 +10,21 @@ from jmcomic import JmcomicText
 jmcomic.disable_jm_log()
 ALBUM_TTL = 600
 
+# 搜索方式 → JM 接口的 main_tag
+SEARCH_BY = {"site": 0, "work": 1, "author": 2, "tag": 3, "actor": 4}
+# 实测（2026-10-24）移动端接口真正生效的排序；评分 tr / 评论 md 结果相同，看不出是否生效，不提供
+ORDERS = ("mr", "mv", "mp", "tf")
+# 时间范围要拼进排序参数（mv_w、mv_m），而且只对“最多观看”有效
+TIMES = ("a", "t", "w", "m")
+# 分类浏览：cosplay、英文站在移动端会退回成“同人”“全部”，不提供
+CATEGORIES = ("0", "doujin", "single", "short", "another", "hanman", "meiman", "3D")
+
+
+def order_param(order: str, time_range: str) -> str:
+    if order == "mv" and time_range in ("t", "w", "m"):
+        return f"mv_{time_range}"
+    return order
+
 
 class JM:
     def __init__(self):
@@ -22,14 +37,23 @@ class JM:
             self._client = jmcomic.JmOption.construct({"client": {"impl": "api"}}).new_jm_client()
         return self._client
 
-    def _search(self, query: str, page: int, by: str = "site") -> dict:
-        with self._lock:
-            client = self._cl()
-            search = client.search_author if by == "author" else client.search_site
-            result = search(search_query=query, page=page)
+    @staticmethod
+    def _page(result) -> dict:
         items = [{"jm_id": int(aid), "title": info.get("name", ""), "author": info.get("author", "")}
                  for aid, info in result.content]
         return {"total": int(result.total), "pages": result.page_count, "items": items}
+
+    def _search(self, query: str, page: int, by: str = "site", order: str = "mr", time_range: str = "a") -> dict:
+        with self._lock:
+            result = self._cl().search(query, page, SEARCH_BY.get(by, 0), order_param(order, time_range),
+                                       "a", "0", None)
+        return self._page(result)
+
+    def _browse(self, page: int, category: str, order: str, time_range: str) -> dict:
+        """分类浏览和排行榜（排行榜 = 最多观看 + 时间范围）。"""
+        with self._lock:
+            result = self._cl().categories_filter(page, time_range, category, order)
+        return self._page(result)
 
     def _album(self, jm_id: int) -> dict:
         with self._lock:
@@ -120,9 +144,13 @@ class JM:
     async def push_favorites(self, username: str, password: str, jm_ids: list[int]) -> dict:
         return await asyncio.to_thread(lambda: self.push_with_client(self._login(username, password), jm_ids))
 
-    async def search(self, query: str, page: int = 1, by: str = "site") -> dict:
-        """by="site" 按关键词搜索，by="author" 按作者搜索（模糊匹配），每页 80 条。"""
-        return await asyncio.to_thread(self._search, query, page, by)
+    async def search(self, query: str, page: int = 1, by: str = "site", order: str = "mr",
+                     time_range: str = "a") -> dict:
+        """by：site 关键词、work 作品、author 作者、tag 标签、actor 角色。每页 80 条。"""
+        return await asyncio.to_thread(self._search, query, page, by, order, time_range)
+
+    async def browse(self, page: int = 1, category: str = "0", order: str = "mr", time_range: str = "a") -> dict:
+        return await asyncio.to_thread(self._browse, page, category, order, time_range)
 
     async def album(self, jm_id: int, fresh: bool = False) -> dict:
         """作品详情，缓存 10 分钟（Bot 和书架共用）；入库时用 fresh=True 取最新章节。"""

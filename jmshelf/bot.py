@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import time
+from urllib.parse import quote
 
 from telethon import Button, events, functions, types
 from telethon.errors import MessageNotModifiedError
@@ -23,6 +24,7 @@ JM 号：查看详情、入库、收藏。支持 1485198、JM1485198、#JM148519
 多个 JM 号（空格、逗号或换行隔开）：批量入库或收藏
 其他文字：按关键词搜索
 /author 作者名：按作者搜索（作品详情里也可以直接点作者）
+更多搜索方式（作品、标签、角色、排序、排行榜、分类浏览）在书架的“搜索”页
 
 收藏：作品放进收藏夹就算收藏，会自动入库并生成 PDF 发到精选频道。收藏夹在书架里管理。
 
@@ -124,7 +126,9 @@ class Bot:
             if arg:
                 await self._search(event, uid, arg, 1, edit=False)
             else:
-                await event.respond("用法：/search 关键词")
+                button = ui.webapp_button(self.cfg, "打开书架搜索页", "?tab=search")
+                await event.respond("用法：/search 关键词。书架的搜索页支持按作品、作者、标签、角色搜索，还能排序、看排行榜。",
+                                    buttons=[[button]] if button else None)
         elif cmd == "author":
             if arg:
                 await self._author_search(event, arg)
@@ -193,6 +197,9 @@ class Bot:
             nav.append(Button.inline("下一页", f"sp:{view + 1}"))
         if nav:
             rows.append(nav)
+        full = ui.webapp_button(self.cfg, "在书架里搜索（可排序）", f"?search={quote(query)}")
+        if full:
+            rows.append([full])
         text = "\n".join(lines)
         if edit:
             await event.edit(text, parse_mode="html", buttons=rows)
@@ -228,6 +235,9 @@ class Bot:
         rows = self._number_rows([it["jm_id"] for it in items], start)
         if more and start + len(items) < total:
             rows.append([Button.inline("加载更多", f"am:{key}:{start + len(items)}")])
+        full = ui.webapp_button(self.cfg, "在书架里搜索（可排序）", f"?search={quote(state['query'])}&by=author")
+        if start == 0 and full:
+            rows.append([full])
         return "\n".join(lines), rows
 
     async def _search_items(self, state, start, count):
