@@ -158,7 +158,7 @@ SQLite 使用 WAL 模式，表结构如下：
 | `albums` | jm_id、标题、作者、标签、章节数、页数、入库时间 |
 | `chapters` | photo_id、jm_id、序号、标题、页数、频道消息 ID、文件大小、sha256 |
 | `pages` | photo_id、页序号、文件名、数据偏移、长度 |
-| `jobs` | id、类型（archive / drive）、目标、状态、尝试次数、错误、进度消息、时间戳 |
+| `jobs` | id、类型（archive / favorite）、目标、状态、尝试次数、错误、进度消息、时间戳 |
 | `progress` | 用户 ID、jm_id、photo_id、页码、更新时间 |
 | `favorites` | jm_id / photo_id、R2 对象键、文件大小、sha256、上传时间 |
 
