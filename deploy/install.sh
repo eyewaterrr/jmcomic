@@ -37,6 +37,12 @@ if [ ! -f "$ETC/jmcomic.env" ]; then
     echo "已生成 $ETC/jmcomic.env，请填写后再启动：sudo micro $ETC/jmcomic.env"
 fi
 
-install -m 644 "$REPO/deploy/jmcomic.service" /etc/systemd/system/jmcomic.service
+install -d -m 755 "$APP/bin"
+install -m 755 "$REPO/deploy/jmcomic-update.sh" "$APP/bin/jmcomic-update.sh"
+for unit in jmcomic.service jmcomic-update.service jmcomic-update.timer jmcomic-update.path; do
+    install -m 644 "$REPO/deploy/$unit" "/etc/systemd/system/$unit"
+done
 systemctl daemon-reload
+systemctl enable --now jmcomic-update.timer jmcomic-update.path >/dev/null 2>&1 || true
 echo "安装完成。启动或重启：sudo systemctl restart jmcomic；查看日志：journalctl -u jmcomic -f"
+echo "jmcomic 自动更新：每天 04:30 检查（jmcomic-update.timer），手动检查：sudo systemctl start jmcomic-update"

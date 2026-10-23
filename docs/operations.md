@@ -12,7 +12,10 @@
 | `/var/lib/jmcomic/cache/` | 页面缓存，上限 1GB |
 | `/var/lib/jmcomic/covers/` | 封面 |
 | `/var/lib/jmcomic/work/` | 任务临时目录 |
+| `/var/lib/jmcomic/meta/` | 每本作品一份元数据 JSON，用于迁移和恢复 |
+| `/var/lib/jmcomic/update-status.json` | 最近一次 jmcomic 自动更新的结果 |
 | `/etc/systemd/system/jmcomic.service` | 服务，以系统用户 `jmcomic` 运行 |
+| `/etc/systemd/system/jmcomic-update.{service,timer,path}` | jmcomic 自动更新，脚本在 `/opt/jmcomic/bin/jmcomic-update.sh` |
 | `/etc/nginx/sites-available/jmcomic` | 阅读页站点，由 `deploy/nginx-jmcomic.conf` 生成 |
 
 ## 2. 常用命令
@@ -69,7 +72,9 @@ sudo -u jmcomic bash -c 'set -a; . /etc/jmcomic/jmcomic.env; cd /opt/jmcomic && 
   JM_DATA_DIR=/var/lib/jmcomic venv/bin/python -m jmshelf enqueue archive 123456'
 ```
 
-把 `archive` 换成 `favorite`，就是收藏为 PDF。
+把 `archive` 换成 `favorite`，就是生成 PDF。这只生成 PDF，不会把作品放进收藏夹；要收藏，请在 Bot 或书架里操作。
+
+元数据的导出和恢复也用子命令，见第 7 节。
 
 ## 7. 备份与恢复
 
@@ -83,13 +88,24 @@ sudo -u jmcomic bash -c 'set -a; . /etc/jmcomic/jmcomic.env; cd /opt/jmcomic && 
 4. 修改属主：`sudo chown jmcomic: /var/lib/jmcomic/jmshelf.db`。
 5. 启动服务：`sudo systemctl start jmcomic`。
 
+**元数据文件：** 每本作品在 `/var/lib/jmcomic/meta/JM<号>.json` 另存一份元数据，入库、生成 PDF、收藏夹变化时自动更新。
+
+迁移到新服务器时，把整个 `meta/` 目录（加上 `covers/`）拷过去，停服务后运行：
+
+```bash
+sudo -u jmcomic bash -c 'set -a; . /etc/jmcomic/jmcomic.env; cd /opt/jmcomic && \
+  JM_DATA_DIR=/var/lib/jmcomic venv/bin/python -m jmshelf restore-meta /var/lib/jmcomic/meta'
+```
+
+`export-meta` 会从数据库重新生成全部 JSON。
+
 ## 8. 撤销安装
 
 先停掉并删除服务，再删掉 nginx 站点：
 
 ```bash
-sudo systemctl disable --now jmcomic
-sudo rm /etc/systemd/system/jmcomic.service && sudo systemctl daemon-reload
+sudo systemctl disable --now jmcomic jmcomic-update.timer jmcomic-update.path
+sudo rm /etc/systemd/system/jmcomic.service /etc/systemd/system/jmcomic-update.* && sudo systemctl daemon-reload
 sudo rm /etc/nginx/sites-enabled/jmcomic /etc/nginx/sites-available/jmcomic && sudo systemctl reload nginx
 ```
 
@@ -121,3 +137,38 @@ sudo rm /etc/nginx/sites-enabled/jmcomic /etc/nginx/sites-available/jmcomic && s
 
 - 手动测试接口时用 curl。
 - 手机里 Telegram 打开阅读页用的是正常浏览器，不受影响。
+
+## 11. jmcomic 自动更新
+
+**什么时候检查：**
+
+- 每天 04:30 自动检查。
+- 下载出错时也会立即检查一次，6 小时内最多一次。
+
+**有新版本时：** 自动完成升级。
+
+1. 停服务、升级。
+2. 自检，内容包括搜索、取详情、下载并解码两张图片。
+3. 自检通过就启动服务；不通过就装回原版本再启动。
+
+**大版本：** 只私聊提醒，不自动升级。规则详见 architecture.md 第 12 节。
+
+```bash
+sudo systemctl start jmcomic-update                # 立即检查一次
+cat /var/lib/jmcomic/update-status.json            # 最近一次的结果（Bot 的 /status 也会显示）
+journalctl -u jmcomic-update -n 50                 # 更新日志
+systemctl list-timers jmcomic-update.timer         # 下次检查时间
+sudo -u jmcomic bash -c 'cd /opt/jmcomic && venv/bin/python -m jmshelf.selftest'   # 手动自检
+```
+
+**暂停自动更新：**
+
+```bash
+sudo systemctl disable --now jmcomic-update.timer jmcomic-update.path
+```
+
+## 12. JM 收藏夹同步
+
+1. 运行 `sudo micro /etc/jmcomic/jmcomic.env`，填写 `JM_USERNAME` 和 `JM_PASSWORD`，保存后运行 `sudo systemctl restart jmcomic`。
+2. 在 Bot 里发 `/jmsync`，看过统计后点“开始同步”。
+3. 想每天自动同步，在 `/jmsync` 的消息里打开开关即可。

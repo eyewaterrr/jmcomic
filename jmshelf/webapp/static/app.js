@@ -1,5 +1,7 @@
 'use strict';
-// 书架 Mini App：#/ 书架，#/a/<JM号> 作品，#/r/<章节ID>/<页码> 阅读
+// 书架 Mini App
+// 路由：#/ 书架，#/folders 收藏夹管理，#/a/<JM号> 作品，#/r/<章节ID>/<页码> 阅读
+// 启动参数：startapp=c<章节ID> 打开该章；startapp=a<JM号>、?read=<JM号> 从上次位置继续读这本
 (() => {
   const tg = window.Telegram && window.Telegram.WebApp;
   const app = document.getElementById('app');
@@ -22,18 +24,42 @@
     return node;
   }
 
+  const store = {
+    get(key, fallback) {
+      try { return localStorage.getItem(key) ?? fallback; } catch (e) { return fallback; }
+    },
+    set(key, value) {
+      try { localStorage.setItem(key, value); } catch (e) { /* 隐私模式等 */ }
+    },
+  };
+
   let toastTimer = null;
   function toast(msg) {
     toastEl.textContent = msg;
     toastEl.hidden = false;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { toastEl.hidden = true; }, 2600);
+    toastTimer = setTimeout(() => { toastEl.hidden = true; }, 2800);
+  }
+
+  function confirmDialog(message) {
+    return new Promise((resolve) => {
+      if (tg && tg.showConfirm) {
+        try { tg.showConfirm(message, (ok) => resolve(!!ok)); return; } catch (e) { /* 旧版客户端 */ }
+      }
+      resolve(window.confirm(message));
+    });
   }
 
   const notice = (text) => app.replaceChildren(el('p', { class: 'notice' }, text));
   const go = (hash) => { location.hash = hash; };
   const imgUrl = (photo, n) => `/img/${photo}/${n}?t=${encodeURIComponent(S.token)}`;
   const coverUrl = (jm) => `/cover/${jm}?t=${encodeURIComponent(S.token)}`;
+  const NEXT_TEXT = {
+    archive: '已收藏，正在入库，完成后自动生成 PDF',
+    pdf: '已收藏，正在生成 PDF，进度见 Bot 私聊',
+    done: '已保存',
+    none: '已取消收藏，精选频道里的 PDF 保留不删',
+  };
 
   // ---- 登录与请求 ----
   async function login() {
@@ -70,6 +96,7 @@
     const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
     if (parts[0] === 'a' && parts[1]) return { view: 'album', jm: Number(parts[1]) };
     if (parts[0] === 'r' && parts[1]) return { view: 'reader', photo: Number(parts[1]), page: Number(parts[2]) || null };
+    if (parts[0] === 'folders') return { view: 'folders' };
     return { view: 'library' };
   }
 
@@ -82,6 +109,7 @@
 
   async function render() {
     if (S.cleanup) { S.cleanup(); S.cleanup = null; }
+    document.querySelectorAll('.sheet-bg').forEach((n) => n.remove());
     document.body.classList.remove('reading');
     themeDark(false);
     const route = parse();
@@ -89,6 +117,7 @@
     try {
       if (route.view === 'album') await renderAlbum(route.jm);
       else if (route.view === 'reader') await renderReader(route.photo, route.page);
+      else if (route.view === 'folders') await renderFolders();
       else await renderLibrary();
     } catch (e) {
       notice(e.message || String(e));
@@ -96,16 +125,58 @@
     if (tg.BackButton) route.view === 'library' ? tg.BackButton.hide() : tg.BackButton.show();
   }
 
+  // 从上次读到的位置继续读这本：返回要跳转的路由
+  async function continueTarget(jm) {
+    try {
+      const a = await api(`/api/album/${jm}`);
+      if (a.progress) return `#/r/${a.progress.photoId}/${a.progress.page}`;
+      if (a.chapters.length) return `#/r/${a.chapters[0].photoId}`;
+      return `#/a/${jm}`;
+    } catch (e) {
+      toast(e.message);
+      return '#/';
+    }
+  }
+
   // ---- 书架 ----
   async function renderLibrary() {
     S.parent = null;
-    const { items } = await api('/api/library');
-    const head = el('div', { class: 'bar' }, el('h1', {}, '书架'), el('span', { class: 'muted' }, `${items.length} 本`));
-    if (!items.length) {
-      app.replaceChildren(head, el('p', { class: 'notice' }, '书架是空的。在 Bot 里发送 JM 号或关键词，点“入库”后就会出现在这里。'));
-      return;
-    }
-    app.replaceChildren(head, el('div', { class: 'grid' }, items.map(card)));
+    const data = await api('/api/library');
+    let filter = store.get('jm.filter', 'all');
+    let folder = Number(store.get('jm.folder', '0')) || 0;
+    if (folder && !data.folders.some((f) => f.id === folder)) folder = 0;
+
+    const count = el('span', { class: 'muted' });
+    const seg = el('div', { class: 'seg' });
+    const chips = el('div', { class: 'chips' });
+    const grid = el('div', { class: 'grid' });
+    const empty = el('p', { class: 'notice' });
+
+    const draw = () => {
+      seg.replaceChildren(...[['all', '全部'], ['fav', '已收藏'], ['unfav', '未收藏']].map(([key, label]) =>
+        el('button', { class: key === filter ? 'on' : '', onclick: () => { filter = key; store.set('jm.filter', key); draw(); } }, label)));
+
+      chips.hidden = filter !== 'fav';
+      chips.replaceChildren(
+        el('button', { class: folder === 0 ? 'chip on' : 'chip', onclick: () => { folder = 0; store.set('jm.folder', '0'); draw(); } }, '全部收藏夹'),
+        ...data.folders.map((f) => el('button', {
+          class: folder === f.id ? 'chip on' : 'chip',
+          onclick: () => { folder = f.id; store.set('jm.folder', String(f.id)); draw(); },
+        }, `${f.name} ${f.count}`)),
+        el('button', { class: 'chip ghost', onclick: () => go('#/folders') }, '管理收藏夹'));
+
+      let items = data.items;
+      if (filter === 'fav') items = items.filter((i) => i.fav && (!folder || i.folders.includes(folder)));
+      else if (filter === 'unfav') items = items.filter((i) => !i.fav);
+      count.textContent = `${items.length} 本`;
+      grid.replaceChildren(...items.map(card));
+      empty.hidden = items.length > 0;
+      empty.textContent = data.items.length
+        ? (filter === 'fav' ? '这里还没有作品。在作品页点“收藏”，或在 Bot 里点“收藏”。' : '没有符合条件的作品。')
+        : '书架是空的。在 Bot 里发送 JM 号或关键词，点“入库”后就会出现在这里。';
+    };
+    draw();
+    app.replaceChildren(el('div', { class: 'bar' }, el('h1', {}, '书架'), count), seg, chips, grid, empty);
   }
 
   function card(it) {
@@ -117,6 +188,59 @@
         it.fav ? el('span', { class: 'badge' }, '已收藏') : null),
       el('div', { class: 't' }, it.title),
       el('div', { class: 'm' }, meta.join(' · ')));
+  }
+
+  // ---- 收藏夹管理 ----
+  async function renderFolders() {
+    S.parent = '#/';
+    const { folders } = await api('/api/folders');
+    const name = el('input', { class: 'input', placeholder: '新收藏夹的名字', maxLength: 30 });
+    const create = el('button', {
+      class: 'primary small',
+      onclick: async () => {
+        try { await api('/api/folders', { name: name.value }); render(); } catch (e) { toast(e.message); }
+      },
+    }, '新建');
+
+    const row = (f) => {
+      const info = el('div', { class: 'grow' }, el('div', {}, f.name), el('div', { class: 'muted small' },
+        `${f.count} 本` + (f.source === 'jm' ? ' · 由 JM 同步，不能手动修改' : f.default ? ' · 默认' : '')));
+      const actions = [];
+      if (f.source === 'local') {
+        actions.push(el('button', {
+          class: 'chip',
+          onclick: () => {
+            const input = el('input', { class: 'input', value: f.name, maxLength: 30 });
+            li.replaceChildren(input,
+              el('button', {
+                class: 'chip',
+                onclick: async () => {
+                  try { await api(`/api/folders/${f.id}/rename`, { name: input.value }); render(); } catch (e) { toast(e.message); }
+                },
+              }, '保存'),
+              el('button', { class: 'chip ghost', onclick: () => render() }, '取消'));
+            input.focus();
+          },
+        }, '改名'));
+      }
+      if (f.source === 'local' && !f.default) {
+        actions.push(el('button', {
+          class: 'chip danger',
+          onclick: async () => {
+            if (!await confirmDialog(`删除收藏夹“${f.name}”？里面的作品不会被删除。`)) return;
+            try { await api(`/api/folders/${f.id}/delete`, {}); render(); } catch (e) { toast(e.message); }
+          },
+        }, '删除'));
+      }
+      const li = el('li', { class: 'folder-row' }, info, ...actions);
+      return li;
+    };
+
+    app.replaceChildren(el('div', { class: 'album' },
+      el('h2', {}, '收藏夹'),
+      el('p', { class: 'muted small' }, '作品放进任意一个收藏夹就算收藏，会自动生成 PDF 发到精选频道。'),
+      el('div', { class: 'row' }, name, create),
+      el('ol', { class: 'chapters' }, folders.map(row))));
   }
 
   // ---- 作品 ----
@@ -134,21 +258,10 @@
       class: 'primary', disabled: !first,
       onclick: () => go(at ? `#/r/${at.photoId}/${prog.page}` : `#/r/${first.photoId}`),
     }, first ? label : '还没有入库的章节');
+    const favBtn = el('button', { class: 'secondary', onclick: () => openFolderSheet(a) }, a.fav ? '管理收藏夹' : '收藏');
 
-    const favBtn = el('button', {
-      class: 'secondary', disabled: a.fav || a.favPending || a.chapters.length < a.chapterCount,
-      onclick: async () => {
-        favBtn.disabled = true;
-        try {
-          const r = await api('/api/favorite', { jmId: jm });
-          toast(r.status === 'done' ? '已经收藏过了' : '已加入收藏队列，进度会显示在 Bot 私聊里');
-          favBtn.textContent = '正在收藏…';
-        } catch (e) {
-          toast(e.message);
-          favBtn.disabled = false;
-        }
-      },
-    }, a.fav ? '已收藏为 PDF' : a.favPending ? '正在收藏…' : '收藏为 PDF');
+    const member = a.folders.filter((f) => f.member).map((f) => f.name);
+    const pdfText = { done: '已生成', running: '生成中' }[a.pdf] || (a.fav ? '等入库完成后生成' : '收藏后自动生成');
 
     const list = el('ol', { class: 'chapters' }, a.chapters.map((c) => {
       const here = prog && prog.photoId === c.photoId;
@@ -167,9 +280,63 @@
           a.authors.length ? el('p', { class: 'muted' }, a.authors.join('、')) : null,
           a.tags.length ? el('p', { class: 'muted' }, a.tags.join(' · ')) : null)),
       el('div', { class: 'actions' }, readBtn, favBtn),
+      el('p', { class: 'muted small' }, member.length ? `收藏夹：${member.join('、')}` : '未收藏', `　PDF：${pdfText}`),
       el('h3', {}, missing > 0 ? `章节（已入库 ${a.chapters.length}/${a.chapterCount}）` : `章节（${a.chapters.length}）`),
       list,
       missing > 0 ? el('p', { class: 'muted' }, `还有 ${missing} 章没有入库，可以在 Bot 里点“入库”补齐。`) : null));
+  }
+
+  function openFolderSheet(a) {
+    const checks = new Map();
+    const options = el('div', { class: 'checks' });
+    const addOption = (f, checked) => {
+      const box = el('input', { type: 'checkbox', checked });
+      checks.set(f.id, box);
+      options.append(el('label', { class: 'check' }, box, el('span', {}, f.name)));
+    };
+    a.folders.filter((f) => f.source === 'local').forEach((f) => addOption(f, a.fav ? f.member : f.default));
+    const synced = a.folders.filter((f) => f.source === 'jm' && f.member).map((f) => f.name);
+
+    const name = el('input', { class: 'input', placeholder: '新建收藏夹', maxLength: 30 });
+    const create = el('button', {
+      class: 'chip',
+      onclick: async () => {
+        try {
+          const r = await api('/api/folders', { name: name.value });
+          const f = r.folders.find((x) => x.id === r.id);
+          addOption(f, true);
+          name.value = '';
+        } catch (e) { toast(e.message); }
+      },
+    }, '新建');
+
+    const close = () => bg.remove();
+    const save = el('button', {
+      class: 'primary',
+      onclick: async () => {
+        save.disabled = true;
+        const ids = [...checks].filter(([, box]) => box.checked).map(([id]) => id);
+        try {
+          const r = await api(`/api/album/${a.jmId}/folders`, { folderIds: ids });
+          close();
+          toast(NEXT_TEXT[r.next] || '已保存');
+          render();
+        } catch (e) {
+          toast(e.message);
+          save.disabled = false;
+        }
+      },
+    }, '完成');
+
+    const bg = el('div', { class: 'sheet-bg', onclick: (e) => { if (e.target === bg) close(); } },
+      el('div', { class: 'sheet' },
+        el('h3', {}, '收藏到'),
+        options,
+        synced.length ? el('p', { class: 'muted small' }, `JM 同步的收藏夹：${synced.join('、')}（不能在这里修改）`) : null,
+        el('div', { class: 'row' }, name, create),
+        el('p', { class: 'muted small' }, '全部取消勾选就是取消收藏；精选频道里的 PDF 不会删除。'),
+        save));
+    document.body.append(bg);
   }
 
   // ---- 阅读 ----
@@ -345,14 +512,17 @@
       notice(e.message);
       return;
     }
-    if (!location.hash || location.hash === '#' || location.hash === '#/') {
+    // Telegram 把启动参数放在 #tgWebAppData=... 里，这时的 hash 不是本页的路由，要换掉
+    if (!/^#\/./.test(location.hash)) {
+      const params = new URLSearchParams(location.search);
       const sp = d.startParam || '';
-      const q = new URLSearchParams(location.search).get('a') || '';
-      let target = '';
-      if (/^c\d+$/.test(sp)) target = `#/r/${sp.slice(1)}`;
-      else if (/^a\d+$/.test(sp)) target = `#/a/${sp.slice(1)}`;
-      else if (/^\d+$/.test(q)) target = `#/a/${q}`;
-      if (target) history.replaceState(null, '', target);
+      const chapter = /^c(\d+)$/.exec(sp);
+      const album = /^a(\d+)$/.exec(sp);
+      const jm = (album && album[1]) || params.get('read') || params.get('a') || '';
+      let target = '#/';
+      if (chapter) target = `#/r/${chapter[1]}`;
+      else if (/^\d+$/.test(jm)) target = await continueTarget(Number(jm));
+      history.replaceState(null, '', location.pathname + location.search + target);
     }
     window.addEventListener('hashchange', render);
     render();

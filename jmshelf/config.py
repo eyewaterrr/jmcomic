@@ -25,6 +25,8 @@ class Config:
     image_threads: int
     pdf_quality: int
     pdf_volume_mb: int
+    jm_username: str
+    jm_password: str
 
     @property
     def db_path(self) -> Path:
@@ -64,4 +66,6 @@ def load() -> Config:
         image_threads=_int("JM_IMAGE_THREADS", 4),
         pdf_quality=_int("JM_PDF_QUALITY", 85),
         pdf_volume_mb=_int("JM_PDF_VOLUME_MB", 300),
+        jm_username=env.get("JM_USERNAME", "").strip(),
+        jm_password=env.get("JM_PASSWORD", ""),
     )

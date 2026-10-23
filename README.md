@@ -4,7 +4,7 @@
 
 > 当前状态：第一版已部署，正在手机上验收。
 >
-> - 已完成：入库、按页在线阅读、收藏 PDF、用户白名单和每日备份。
+> - 已完成：入库、按页在线阅读、收藏夹（收藏后自动生成 PDF）、JM 收藏夹同步、批量入库、jmcomic 自动更新、元数据导出和恢复、用户白名单、每日备份。
 > - 实测数据：[docs/environment.md](docs/environment.md)
 > - 设计：[docs/architecture.md](docs/architecture.md)
 > - 运维：[docs/operations.md](docs/operations.md)
@@ -23,8 +23,12 @@
 | `jmshelf/webapp/` | Mini App 前端 |
 | `jmshelf/fetch.py`、`jmshelf/pdf.py` | 两个子进程：下载图片、生成 PDF |
 | `jmshelf/pack.py` | CBZ 打包和每页偏移 |
-| `jmshelf/db.py` | SQLite 索引 |
-| `deploy/` | systemd 服务、安装脚本、nginx 模板、配置示例 |
+| `jmshelf/db.py` | SQLite 索引：书目、收藏夹、PDF 记录、任务、进度 |
+| `jmshelf/ids.py` | 从消息里识别 JM 号：链接、各种前缀、全角数字、多个号码 |
+| `jmshelf/sync.py` | JM 账号收藏夹到本地收藏夹的单向镜像 |
+| `jmshelf/meta.py` | 每本作品的元数据 JSON：导出、恢复 |
+| `jmshelf/selftest.py` | jmcomic 自检，供自动更新使用 |
+| `deploy/` | systemd 服务、jmcomic 自动更新（脚本、timer、path）、安装脚本、nginx 模板、配置示例 |
 | `tests/` | 单元测试，运行 `python -m pytest` |
 
 ## 一、最终目的

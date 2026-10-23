@@ -1,16 +1,19 @@
 """启动服务：python -m jmshelf
 
-运维用的子命令（服务运行时也能用，任务由服务里的队列执行）：
-    python -m jmshelf enqueue archive|favorite <JM号>
+运维用的子命令（服务运行时也能用）：
+    python -m jmshelf enqueue archive|favorite <JM号>   建任务，由服务里的队列执行
+    python -m jmshelf export-meta                      从数据库重新生成每本的元数据 JSON
+    python -m jmshelf restore-meta <目录>               用元数据 JSON 恢复数据库（先停服务）
 """
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 import uvicorn
 from telethon import TelegramClient
 
-from . import config
+from . import config, meta
 from .bot import Bot
 from .db import DB
 from .jm import JM
@@ -25,6 +28,8 @@ async def serve(cfg):
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     db = DB(cfg.db_path)
     db.ensure_owner(cfg.owner_id)
+    if not any(meta.meta_dir(cfg.data_dir).glob("JM*.json")):
+        log.info("已导出 %s 本作品的元数据", meta.export_all(db, cfg.data_dir))
 
     client = TelegramClient(str(cfg.session_path), cfg.api_id, cfg.api_hash,
                             use_ipv6=False, flood_sleep_threshold=120)
@@ -71,6 +76,12 @@ def main():
     args = sys.argv[1:]
     if args[:1] == ["enqueue"] and len(args) == 3 and args[1] in ("archive", "favorite") and args[2].isdigit():
         enqueue(cfg, args[1], int(args[2]))
+    elif args == ["export-meta"]:
+        print(f"已导出 {meta.export_all(DB(cfg.db_path), cfg.data_dir)} 本，目录 {meta.meta_dir(cfg.data_dir)}")
+    elif args[:1] == ["restore-meta"] and len(args) == 2:
+        db = DB(cfg.db_path)
+        db.ensure_owner(cfg.owner_id)
+        print(f"已恢复 {meta.restore_all(db, Path(args[1]))} 本")
     elif not args:
         asyncio.run(serve(cfg))
     else:

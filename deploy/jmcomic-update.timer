@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily jmcomic update check (04:30)
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=10min
+Persistent=true
+Unit=jmcomic-update.service
+
+[Install]
+WantedBy=timers.target

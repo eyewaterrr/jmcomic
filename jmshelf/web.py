@@ -221,21 +221,27 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
             "startParam": info["start_param"],
         }
 
+    def folder_list(uid: int) -> list[dict]:
+        return [{"id": f["id"], "name": f["name"], "source": f["source"], "default": bool(f["is_default"]),
+                 "count": f["count"]} for f in db.folders(uid)]
+
     @app.get("/api/library")
     async def api_library(request: Request):
         uid = auth(request)
         progress = db.all_progress(uid)
         items = []
-        for a in db.albums():
+        for a in db.albums(uid):
             p = progress.get(a["jm_id"])
             read = db.chapter(p["photo_id"]) if p else None
+            folder_ids = [int(x) for x in a["folder_ids"].split(",")] if a["folder_ids"] else []
             items.append({
                 "jmId": a["jm_id"], "title": a["title"], "chapters": a["chapter_count"],
-                "archived": a["archived"], "pages": a["pages"], "fav": bool(a["fav"]),
+                "archived": a["archived"], "pages": a["pages"], "fav": bool(folder_ids),
+                "folders": folder_ids, "pdf": bool(a["pdf"]),
                 "progress": {"sort": read["sort"], "page": p["page"]} if read else None,
                 "cover": (cfg.cover_dir / f"{a['jm_id']}.jpg").exists(),
             })
-        return {"items": items}
+        return {"items": items, "folders": folder_list(uid)}
 
     @app.get("/api/album/{jm_id}")
     async def api_album(jm_id: int, request: Request):
@@ -244,16 +250,64 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
         if album is None:
             raise HTTPException(404, "书库里没有这本")
         p = db.progress(uid, jm_id)
+        member = {f["id"] for f in db.album_folders(uid, jm_id)}
         return {
             "jmId": jm_id, "title": album["title"], "authors": json.loads(album["authors"]),
             "tags": json.loads(album["tags"]), "chapterCount": album["chapter_count"],
-            "fav": db.favorite(jm_id) is not None,
-            "favPending": db.active_job("favorite", jm_id) is not None,
+            "fav": bool(member),
+            "folders": [dict(f, member=f["id"] in member) for f in folder_list(uid)],
+            "pdf": "done" if db.pdf_record(jm_id) else "running" if db.active_job("favorite", jm_id) else "none",
             "cover": (cfg.cover_dir / f"{jm_id}.jpg").exists(),
             "chapters": [{"photoId": c["photo_id"], "sort": c["sort"], "title": c["title"],
                           "pages": c["page_count"]} for c in db.chapters(jm_id)],
             "progress": {"photoId": p["photo_id"], "page": p["page"]} if p else None,
         }
+
+    @app.post("/api/album/{jm_id}/folders")
+    async def api_album_folders(jm_id: int, request: Request):
+        """设置作品在本地收藏夹里的归属。由不收藏变成收藏时自动安排入库或生成 PDF。"""
+        uid = auth(request)
+        if db.album(jm_id) is None:
+            raise HTTPException(404, "书库里没有这本")
+        try:
+            wanted = {int(x) for x in (await body(request)).get("folderIds", [])}
+            db.set_album_folders(uid, jm_id, wanted)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(400, str(e) or "参数不对")
+        worker.save_meta(jm_id)
+        result = await worker.after_favorite(uid, jm_id) if db.is_favorited(uid, jm_id) else "none"
+        return {"ok": True, "fav": db.is_favorited(uid, jm_id), "next": result}
+
+    @app.get("/api/folders")
+    async def api_folders(request: Request):
+        return {"folders": folder_list(auth(request))}
+
+    @app.post("/api/folders")
+    async def api_folder_create(request: Request):
+        uid = auth(request)
+        try:
+            folder_id = db.create_folder(uid, (await body(request)).get("name", ""))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"id": folder_id, "folders": folder_list(uid)}
+
+    @app.post("/api/folders/{folder_id}/rename")
+    async def api_folder_rename(folder_id: int, request: Request):
+        uid = auth(request)
+        try:
+            db.rename_folder(uid, folder_id, (await body(request)).get("name", ""))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"folders": folder_list(uid)}
+
+    @app.post("/api/folders/{folder_id}/delete")
+    async def api_folder_delete(folder_id: int, request: Request):
+        uid = auth(request)
+        try:
+            db.delete_folder(uid, folder_id)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"folders": folder_list(uid)}
 
     @app.get("/api/chapter/{photo_id}")
     async def api_chapter(photo_id: int, request: Request):
@@ -319,15 +373,24 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
 
     @app.post("/api/favorite")
     async def api_favorite(request: Request):
+        """收藏到默认收藏夹；返回后续动作：archive（先入库）/ pdf（生成 PDF）/ done。"""
         uid = auth(request)
         try:
             jm_id = int((await body(request)).get("jmId"))
         except (TypeError, ValueError):
             raise HTTPException(400, "缺少参数")
-        if db.favorite(jm_id):
-            return {"status": "done"}
-        status, _ = await worker.submit("favorite", jm_id, uid)
-        return {"status": status}
+        return {"next": await worker.favorite(uid, jm_id)}
+
+    @app.post("/api/unfavorite")
+    async def api_unfavorite(request: Request):
+        uid = auth(request)
+        try:
+            jm_id = int((await body(request)).get("jmId"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "缺少参数")
+        db.unfavorite(uid, jm_id)
+        worker.save_meta(jm_id)
+        return {"ok": True}
 
     app.mount("/static", StaticFiles(directory=WEBAPP_DIR / "static"), name="static")
     return app
