@@ -1,17 +1,21 @@
 """在主进程里调用 jmcomic 做搜索、取详情、下载封面（都很轻，放在线程里跑）。"""
 import asyncio
 import threading
+import time
 from pathlib import Path
 
 import jmcomic
+from jmcomic import JmcomicText
 
 jmcomic.disable_jm_log()
+ALBUM_TTL = 600
 
 
 class JM:
     def __init__(self):
         self._client = None
         self._lock = threading.Lock()
+        self._albums: dict[int, tuple[float, dict]] = {}
 
     def _cl(self):
         if self._client is None:
@@ -117,8 +121,30 @@ class JM:
     async def search(self, query: str, page: int = 1) -> dict:
         return await asyncio.to_thread(self._search, query, page)
 
-    async def album(self, jm_id: int) -> dict:
-        return await asyncio.to_thread(self._album, jm_id)
+    async def album(self, jm_id: int, fresh: bool = False) -> dict:
+        """作品详情，缓存 10 分钟（Bot 和书架共用）；入库时用 fresh=True 取最新章节。"""
+        hit = self._albums.get(jm_id)
+        if hit and not fresh and time.time() - hit[0] < ALBUM_TTL:
+            return hit[1]
+        album = await asyncio.to_thread(self._album, jm_id)
+        self._albums[jm_id] = (time.time(), album)
+        return album
+
+    def cached_album(self, jm_id: int) -> dict | None:
+        hit = self._albums.get(jm_id)
+        return hit[1] if hit else None
+
+    @staticmethod
+    def fetch_cover(jm_id: int) -> bytes:
+        """直接从 JM 图片服务器取竖版封面（不经过接口客户端，可以并发）。"""
+        from curl_cffi import requests
+
+        for size in ("_3x4", ""):
+            resp = requests.get(JmcomicText.get_album_cover_url(str(jm_id), size=size),
+                                impersonate="chrome", timeout=15)
+            if resp.status_code == 200 and resp.content[:3] == b"\xff\xd8\xff":
+                return resp.content
+        raise LookupError(f"JM{jm_id} 没有封面")
 
     async def cover(self, jm_id: int, path: Path):
         await asyncio.to_thread(self._cover, jm_id, path)

@@ -217,6 +217,26 @@ class DB:
         rows = self._all(f"SELECT DISTINCT jm_id FROM chapters WHERE jm_id IN ({marks})", *jm_ids)
         return {r["jm_id"] for r in rows}
 
+    def album_states(self, user_id: int, jm_ids: list[int]) -> dict[int, dict]:
+        """一批作品在书库里的状态：已入库章节数、总章节数、是否被该用户收藏、PDF、进行中的任务。"""
+        out = {i: {"chapters": 0, "total": 0, "fav": False, "pdf": False, "archiving": False, "pdfJob": False}
+               for i in jm_ids}
+        if not jm_ids:
+            return out
+        marks = ",".join("?" * len(jm_ids))
+        for r in self._all(f"SELECT a.jm_id, a.chapter_count, (SELECT COUNT(*) FROM chapters c "
+                           f"WHERE c.jm_id=a.jm_id) AS n FROM albums a WHERE a.jm_id IN ({marks})", *jm_ids):
+            out[r["jm_id"]].update(total=r["chapter_count"], chapters=r["n"])
+        for r in self._all(f"SELECT DISTINCT fi.jm_id FROM folder_items fi JOIN folders f ON f.id=fi.folder_id "
+                           f"WHERE f.user_id=? AND fi.jm_id IN ({marks})", user_id, *jm_ids):
+            out[r["jm_id"]]["fav"] = True
+        for r in self._all(f"SELECT jm_id FROM favorites WHERE jm_id IN ({marks})", *jm_ids):
+            out[r["jm_id"]]["pdf"] = True
+        for r in self._all(f"SELECT kind, jm_id FROM jobs WHERE status IN ('queued', 'running') "
+                           f"AND jm_id IN ({marks})", *jm_ids):
+            out[r["jm_id"]]["archiving" if r["kind"] == "archive" else "pdfJob"] = True
+        return out
+
     def fully_archived(self, jm_id: int) -> bool:
         album = self.album(jm_id)
         return bool(album) and len(self.chapters(jm_id)) >= album["chapter_count"]
@@ -447,6 +467,10 @@ class DB:
 
     def recent_jobs(self, limit: int = 10):
         return self._all("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", limit)
+
+    def job_counts(self) -> dict:
+        rows = self._all("SELECT status, COUNT(*) AS n FROM jobs WHERE status IN ('queued', 'running') GROUP BY status")
+        return {r["status"]: r["n"] for r in rows}
 
     def queued_count(self) -> int:
         return self._one("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued', 'running')")["n"]

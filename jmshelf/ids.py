@@ -21,19 +21,17 @@ BARE = re.compile(r"\d{3,9}")
 def extract(text: str) -> list[tuple[str, int]]:
     """返回 [(类型, 号码)]，类型是 album 或 photo；按出现顺序去重。"""
     text = unicodedata.normalize("NFKC", text or "")
-    found: list[tuple[str, int]] = []
-
-    def add(kind: str, number: str):
-        item = (kind, int(number))
-        if item not in found and len(found) < MAX_IDS:
-            found.append(item)
-
+    hits: list[tuple[int, str, int]] = []  # (位置, 类型, 号码)，最后按出现位置排序
     for m in URL.finditer(text):
-        add(m.group(1).lower(), m.group(2))
-    rest = URL.sub(" ", text)
+        hits.append((m.start(), m.group(1).lower(), int(m.group(2))))
+    rest = URL.sub(lambda m: " " * len(m.group(0)), text)  # 等长替换，位置保持不变
     for m in PREFIXED.finditer(rest):
-        add("album", m.group(1))
-    if not found and NUMBERS_ONLY.match(rest.strip() or "x"):
-        for m in BARE.finditer(rest):
-            add("album", m.group(0))
+        hits.append((m.start(), "album", int(m.group(1))))
+    if not hits and NUMBERS_ONLY.match(rest.strip() or "x"):
+        hits = [(m.start(), "album", int(m.group(0))) for m in BARE.finditer(rest)]
+
+    found: list[tuple[str, int]] = []
+    for _, kind, number in sorted(hits):
+        if (kind, number) not in found and len(found) < MAX_IDS:
+            found.append((kind, number))
     return found

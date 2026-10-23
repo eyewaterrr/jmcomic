@@ -121,6 +121,26 @@ class Worker:
             return "pdf"
         return "done"
 
+    async def archive_many(self, user_id: int, jm_ids: list[int]) -> int:
+        """批量入库，跳过已完整入库和已在队列里的。返回新加入队列的本数。"""
+        todo = [j for j in dict.fromkeys(jm_ids)
+                if not self.db.fully_archived(j) and not self.db.active_job("archive", j)]
+        if todo:
+            await self.start_batch(user_id, f"批量入库 {len(todo)} 本", todo, [])
+        return len(todo)
+
+    async def favorite_many(self, user_id: int, jm_ids: list[int]) -> int | None:
+        """批量收藏到默认收藏夹；没入库的先入库，入库后自动生成 PDF。"""
+        jm_ids = list(dict.fromkeys(jm_ids))
+        self.queue_jm_push(user_id, [j for j in jm_ids if not self.db.is_favorited(user_id, j)])
+        folder = self.db.default_folder(user_id)
+        for jm_id in jm_ids:
+            self.db.add_to_folder(folder, jm_id)
+            self.save_meta(jm_id)
+        archive = [j for j in jm_ids if not self.db.fully_archived(j)]
+        pdf = [j for j in jm_ids if self.db.fully_archived(j) and not self.db.pdf_record(j)]
+        return await self.start_batch(user_id, f"批量收藏 {len(jm_ids)} 本", archive, pdf)
+
     async def start_batch(self, user_id: int, label: str, archive_ids: list[int], pdf_ids: list[int]) -> int | None:
         """建一个批次：archive_ids 入库（被收藏的入库后自动生成 PDF），pdf_ids 直接生成 PDF。"""
         archive_ids = [i for i in archive_ids if not self.db.active_job("archive", i)]
@@ -327,7 +347,7 @@ class Worker:
     async def _archive(self, job, workdir: Path):
         jm_id = job["jm_id"]
         await self._status(job, "获取作品信息", force=True)
-        album = await self.jm.album(jm_id)
+        album = await self.jm.album(jm_id, fresh=True)
         self.db.upsert_album(album)
         thumb = await self.ensure_cover(jm_id)
         chapters = album["chapters"]

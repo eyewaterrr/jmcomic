@@ -13,12 +13,15 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from . import ids
+
 log = logging.getLogger(__name__)
 
 WEBAPP_DIR = Path(__file__).parent / "webapp"
 TOKEN_TTL = 12 * 3600
 INIT_DATA_TTL = 24 * 3600
 PREFETCH_PAGES = 6
+JM_COVER_LIMIT = 5000
 MIME = {".webp": "image/webp", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif"}
 
 
@@ -394,6 +397,149 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
         db.unfavorite(uid, jm_id)
         worker.save_meta(jm_id)
         return {"ok": True}
+
+    # ---- 搜索页、作品详情、任务页（和 Bot 对话的功能相同） ----
+    jm = worker.jm
+    cover_sem = asyncio.Semaphore(6)
+    jm_cover_dir = cfg.cache_dir / "jmcovers"
+
+    def state_of(st: dict, chapter_total: int | None = None) -> str:
+        total = chapter_total or st["total"]
+        if st["archiving"]:
+            return "archiving"
+        if total and st["chapters"] >= total:
+            return "archived"
+        return "partial" if st["chapters"] else "none"
+
+    def title_of(jm_id: int) -> str:
+        row = db.album(jm_id)
+        if row:
+            return row["title"]
+        cached = jm.cached_album(jm_id)
+        return cached["title"] if cached else ""
+
+    def decorate(uid: int, items: list[dict]) -> list[dict]:
+        states = db.album_states(uid, [it["jmId"] for it in items])
+        for it in items:
+            st = states[it["jmId"]]
+            it.update(state=state_of(st), fav=st["fav"], pdf="done" if st["pdf"] else "running" if st["pdfJob"] else "none")
+        return items
+
+    def id_list(data: dict) -> list[int]:
+        try:
+            result = list(dict.fromkeys(int(x) for x in data.get("jmIds", [])))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "JM 号格式不对")
+        if not result or len(result) > 50:
+            raise HTTPException(400, "一次最多 50 本")
+        return result
+
+    @app.get("/api/jm/search")
+    async def api_jm_search(request: Request, q: str = "", page: int = 1):
+        """和给 Bot 发消息一样：识别出 JM 号就列出这些作品，否则按关键词搜索（每页 80 条）。"""
+        uid = auth(request)
+        q = q.strip()
+        if not q:
+            raise HTTPException(400, "请输入关键词或 JM 号")
+        found = ids.extract(q)
+        if found:
+            jm_ids = []
+            for kind, number in found:
+                try:
+                    jm_id = await jm.photo_album(number) if kind == "photo" else number
+                except Exception:
+                    continue
+                if jm_id not in jm_ids:
+                    jm_ids.append(jm_id)
+            items = [{"jmId": i, "title": title_of(i), "author": ""} for i in jm_ids]
+            return {"mode": "ids", "items": decorate(uid, items), "total": len(items), "page": 1, "pages": 1}
+        try:
+            res = await jm.search(q, max(page, 1))
+        except Exception as e:
+            log.info("搜索 %s 失败：%s", q, e)
+            raise HTTPException(502, "JM 搜索暂时不可用，请稍后再试")
+        items = [{"jmId": it["jm_id"], "title": it["title"], "author": it["author"]} for it in res["items"]]
+        return {"mode": "search", "items": decorate(uid, items), "total": res["total"],
+                "page": page, "pages": res["pages"]}
+
+    @app.get("/api/jm/album/{jm_id}")
+    async def api_jm_album(jm_id: int, request: Request, fresh: int = 0):
+        uid = auth(request)
+        try:
+            a = await jm.album(jm_id, bool(fresh))
+        except Exception:
+            raise HTTPException(404, f"找不到 JM{jm_id}，或者暂时取不到详情")
+        st = db.album_states(uid, [jm_id])[jm_id]
+        folders = [f["name"] for f in db.album_folders(uid, jm_id)]
+        return {
+            "jmId": jm_id, "title": a["title"], "authors": a["authors"], "works": a["works"], "tags": a["tags"],
+            "pageCount": a["page_count"],
+            "chapters": [{"photoId": c["photo_id"], "sort": c["sort"], "title": c["title"]} for c in a["chapters"]],
+            "state": state_of(st, len(a["chapters"])), "archivedChapters": st["chapters"],
+            "fav": bool(folders), "folders": folders, "inLibrary": db.album(jm_id) is not None,
+            "pdf": "done" if st["pdf"] else "running" if st["pdfJob"] else "none",
+        }
+
+    @app.post("/api/jm/archive")
+    async def api_jm_archive(request: Request):
+        uid = auth(request)
+        jm_ids = id_list(await body(request))
+        if len(jm_ids) == 1:
+            if db.fully_archived(jm_ids[0]):
+                return {"queued": 0}
+            status, _ = await worker.submit("archive", jm_ids[0], uid)
+            return {"queued": 1 if status == "created" else 0}
+        return {"queued": await worker.archive_many(uid, jm_ids)}
+
+    @app.post("/api/jm/favorite")
+    async def api_jm_favorite(request: Request):
+        uid = auth(request)
+        jm_ids = id_list(await body(request))
+        if len(jm_ids) == 1:
+            return {"next": await worker.favorite(uid, jm_ids[0])}
+        await worker.favorite_many(uid, jm_ids)
+        return {"next": "batch"}
+
+    @app.get("/api/jobs")
+    async def api_jobs(request: Request):
+        auth(request)
+        items = [{
+            "id": j["id"], "kind": j["kind"], "jmId": j["jm_id"], "title": title_of(j["jm_id"]),
+            "status": j["status"], "step": j["step"], "error": j["error"], "attempts": j["attempts"],
+            "retryAt": j["run_after"] if j["status"] == "queued" and j["run_after"] > time.time() else 0,
+            "updatedAt": j["updated_at"],
+        } for j in db.recent_jobs(40)]
+        counts = db.job_counts()
+        return {"items": items, "queued": counts.get("queued", 0), "running": counts.get("running", 0)}
+
+    def trim_jm_covers():
+        files = sorted(jm_cover_dir.glob("*.jpg"), key=lambda p: p.stat().st_mtime)
+        for p in files[:max(0, len(files) - JM_COVER_LIMIT + 1000)]:
+            p.unlink(missing_ok=True)
+
+    @app.get("/jmcover/{jm_id}")
+    async def jm_cover(jm_id: int, request: Request):
+        """封面：已入库的用本地封面，没入库的由服务器代取 JM 竖版封面并缓存（手机直连 JM 很慢）。"""
+        auth(request)
+        headers = {"Cache-Control": "private, max-age=604800"}
+        local = cfg.cover_dir / f"{jm_id}.jpg"
+        if local.exists():
+            return FileResponse(local, media_type="image/jpeg", headers=headers)
+        path = jm_cover_dir / f"{jm_id}.jpg"
+        if not path.exists():
+            async with cover_sem:
+                if not path.exists():
+                    try:
+                        data = await asyncio.to_thread(jm.fetch_cover, jm_id)
+                    except Exception:
+                        raise HTTPException(404, "封面取不到")
+                    jm_cover_dir.mkdir(parents=True, exist_ok=True)
+                    tmp = path.with_suffix(".tmp")
+                    tmp.write_bytes(data)
+                    tmp.replace(path)
+                    if len(list(jm_cover_dir.glob("*.jpg"))) > JM_COVER_LIMIT:
+                        trim_jm_covers()
+        return FileResponse(path, media_type="image/jpeg", headers=headers)
 
     app.mount("/static", StaticFiles(directory=WEBAPP_DIR / "static"), name="static")
     return app

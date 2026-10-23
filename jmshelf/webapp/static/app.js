@@ -1,12 +1,13 @@
 'use strict';
 // 书架 Mini App
-// 路由：#/ 书架，#/folders 收藏夹管理，#/a/<JM号> 作品，#/r/<章节ID>/<页码> 阅读
+// 路由：顶部标签 #/ 书架、#/search 搜索、#/jobs 任务；#/folders 收藏夹管理，#/a/<JM号> 书库里的作品，
+//       #/jm/<JM号> JM 作品详情（搜索结果），#/r/<章节ID>/<页码> 阅读
 // 启动参数：startapp=c<章节ID> 打开该章；startapp=a<JM号>、?read=<JM号> 从上次位置继续读这本
 (() => {
   const tg = window.Telegram && window.Telegram.WebApp;
   const app = document.getElementById('app');
   const toastEl = document.getElementById('toast');
-  const S = { token: '', user: null, cleanup: null, parent: null };
+  const S = { token: '', user: null, cleanup: null, parent: null, tab: 'library', search: null };
 
   function el(tag, props = {}, ...children) {
     const node = document.createElement(tag);
@@ -97,6 +98,9 @@
     if (parts[0] === 'a' && parts[1]) return { view: 'album', jm: Number(parts[1]) };
     if (parts[0] === 'r' && parts[1]) return { view: 'reader', photo: Number(parts[1]), page: Number(parts[2]) || null };
     if (parts[0] === 'folders') return { view: 'folders' };
+    if (parts[0] === 'search') return { view: 'search' };
+    if (parts[0] === 'jobs') return { view: 'jobs' };
+    if (parts[0] === 'jm' && parts[1]) return { view: 'jm', jm: Number(parts[1]) };
     return { view: 'library' };
   }
 
@@ -118,11 +122,15 @@
       if (route.view === 'album') await renderAlbum(route.jm);
       else if (route.view === 'reader') await renderReader(route.photo, route.page);
       else if (route.view === 'folders') await renderFolders();
+      else if (route.view === 'search') await renderSearch();
+      else if (route.view === 'jobs') await renderJobs();
+      else if (route.view === 'jm') await renderJm(route.jm);
       else await renderLibrary();
     } catch (e) {
       notice(e.message || String(e));
     }
-    if (tg.BackButton) route.view === 'library' ? tg.BackButton.hide() : tg.BackButton.show();
+    const top = ['library', 'search', 'jobs'].includes(route.view);
+    if (tg.BackButton) top ? tg.BackButton.hide() : tg.BackButton.show();
   }
 
   // 从上次读到的位置继续读这本：返回要跳转的路由
@@ -141,6 +149,7 @@
   // ---- 书架 ----
   async function renderLibrary() {
     S.parent = null;
+    S.tab = 'library';
     const data = await api('/api/library');
     let filter = store.get('jm.filter', 'all');
     let folder = Number(store.get('jm.folder', '0')) || 0;
@@ -176,7 +185,7 @@
         : '书架是空的。在 Bot 里发送 JM 号或关键词，点“入库”后就会出现在这里。';
     };
     draw();
-    app.replaceChildren(el('div', { class: 'bar' }, el('h1', {}, '书架'), count), seg, chips, grid, empty);
+    app.replaceChildren(tabsBar('library'), seg, chips, el('div', { class: 'sub' }, count), grid, empty);
   }
 
   function card(it) {
@@ -337,6 +346,244 @@
         el('p', { class: 'muted small' }, '全部取消勾选就是取消收藏；精选频道里的 PDF 不会删除。'),
         save));
     document.body.append(bg);
+  }
+
+  // ---- 顶部标签 ----
+  const TABS = [['library', '书架', '#/'], ['search', '搜索', '#/search'], ['jobs', '任务', '#/jobs']];
+  function tabsBar(active) {
+    return el('nav', { class: 'tabs' }, TABS.map(([key, label, hash]) =>
+      el('button', { class: key === active ? 'on' : '', onclick: () => { if (key !== active) go(hash); } }, label)));
+  }
+
+  const STATE_TEXT = { archived: '已入库', archiving: '入库中', partial: '部分入库' };
+  const jmCoverUrl = (jm) => `/jmcover/${jm}?t=${encodeURIComponent(S.token)}`;
+
+  // ---- 搜索（和给 Bot 发消息的功能相同） ----
+  function searchCard(it) {
+    return el('a', { class: 'card', href: `#/jm/${it.jmId}`, 'data-jm': it.jmId },
+      el('div', { class: 'cover' },
+        el('img', { src: jmCoverUrl(it.jmId), loading: 'lazy', alt: '' }),
+        STATE_TEXT[it.state] ? el('span', { class: 'badge' }, STATE_TEXT[it.state]) : null,
+        it.fav ? el('span', { class: 'badge right' }, '已收藏') : null),
+      el('div', { class: 't' }, it.title || `JM${it.jmId}`),
+      el('div', { class: 'm' }, it.author ? `JM${it.jmId} · ${it.author}` : `JM${it.jmId}`));
+  }
+
+  async function renderSearch() {
+    S.tab = 'search';
+    const st = S.search || (S.search = { q: '', mode: '', items: [], page: 0, pages: 0, total: 0, scroll: 0 });
+    let loading = false;
+
+    const input = el('textarea', {
+      class: 'input search-input', rows: 1, value: st.q,
+      placeholder: '关键词、JM 号或作品链接，可一次粘贴多个号码',
+    });
+    const info = el('p', { class: 'muted small search-info' });
+    const bulk = el('div', { class: 'chips bulk' });
+    const grid = el('div', { class: 'grid' });
+    const more = el('p', { class: 'notice small' });
+
+    const drawInfo = () => {
+      if (!st.mode) {
+        info.textContent = '和给 Bot 发消息一样：关键词就搜索；JM 号、#JM、作品链接、全角数字都能识别；多个号码用空格、逗号或换行隔开。';
+      } else {
+        info.textContent = st.mode === 'ids' ? `识别到 ${st.items.length} 个 JM 号` : `“${st.q}”共 ${st.total} 条`;
+      }
+      bulk.replaceChildren();
+      if (st.mode === 'ids' && st.items.length > 1) {
+        const todo = st.items.filter((i) => i.state === 'none' || i.state === 'partial').map((i) => i.jmId);
+        if (todo.length) bulk.append(el('button', { class: 'chip', onclick: () => bulkAction('archive', todo) }, `全部入库（${todo.length} 本）`));
+        bulk.append(el('button', { class: 'chip', onclick: () => bulkAction('favorite', st.items.map((i) => i.jmId)) }, '全部收藏'));
+      }
+      bulk.hidden = !bulk.childElementCount;
+      more.hidden = !st.mode || !st.items.length;
+      more.textContent = st.mode === 'search' && st.page < st.pages ? '继续下滑加载更多' : '没有更多了';
+    };
+    const drawAll = () => { grid.replaceChildren(...st.items.map(searchCard)); drawInfo(); };
+
+    // 多个 JM 号时先列出号码，再逐个补上标题
+    const fillTitles = async () => {
+      for (const it of st.items.filter((i) => !i.title)) {
+        try {
+          const a = await api(`/api/jm/album/${it.jmId}`);
+          it.title = a.title;
+          it.author = a.authors.join('、');
+        } catch (e) {
+          it.title = '取不到详情';
+        }
+        const card = grid.querySelector(`[data-jm="${it.jmId}"]`);
+        if (card) card.replaceWith(searchCard(it));
+      }
+    };
+
+    const search = async (q) => {
+      q = q.trim();
+      if (!q || loading) return;
+      loading = true;
+      input.blur();
+      Object.assign(st, { q, mode: '', items: [], page: 0, pages: 0, total: 0 });
+      drawAll();
+      info.textContent = '搜索中…';
+      try {
+        const d = await api(`/api/jm/search?q=${encodeURIComponent(q)}&page=1`);
+        Object.assign(st, { mode: d.mode, items: d.items, page: d.page, pages: d.pages, total: d.total });
+        drawAll();
+        window.scrollTo(0, 0);
+        if (d.mode === 'ids') fillTitles();
+      } catch (e) {
+        info.textContent = e.message;
+      }
+      loading = false;
+    };
+
+    const loadMore = async () => {
+      if (loading || st.mode !== 'search' || st.page >= st.pages) return;
+      loading = true;
+      more.textContent = '加载中…';
+      try {
+        const d = await api(`/api/jm/search?q=${encodeURIComponent(st.q)}&page=${st.page + 1}`);
+        const seen = new Set(st.items.map((i) => i.jmId));
+        const add = d.items.filter((i) => !seen.has(i.jmId));
+        st.items.push(...add);
+        st.page = d.page;
+        grid.append(...add.map(searchCard));
+      } catch (e) {
+        toast(e.message);
+      }
+      loading = false;
+      drawInfo();
+    };
+
+    const bulkAction = async (kind, jmIds) => {
+      try {
+        const r = await api(`/api/jm/${kind}`, { jmIds });
+        if (kind === 'archive') toast(r.queued ? `已加入入库队列 ${r.queued} 本，进度见“任务”` : '都已经入库或正在入库');
+        else toast('已全部收藏，入库和 PDF 进度见“任务”');
+        const d = await api(`/api/jm/search?q=${encodeURIComponent(st.q)}&page=1`);
+        const byId = new Map(d.items.map((i) => [i.jmId, i]));
+        st.items.forEach((it) => Object.assign(it, byId.get(it.jmId) || {}, { title: it.title, author: it.author }));
+        drawAll();
+      } catch (e) {
+        toast(e.message);
+      }
+    };
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); search(input.value); }
+    });
+    app.replaceChildren(tabsBar('search'),
+      el('div', { class: 'searchbar' }, input, el('button', { class: 'primary small', onclick: () => search(input.value) }, '搜索')),
+      info, bulk, grid, more);
+    drawAll();
+    if (st.items.length) window.scrollTo(0, st.scroll);
+    else setTimeout(() => input.focus(), 50);
+
+    const io = new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) loadMore(); },
+      { rootMargin: '600px 0px' });
+    io.observe(more);
+    S.cleanup = () => { st.scroll = window.scrollY; io.disconnect(); };
+  }
+
+  // ---- JM 作品详情（搜索结果点进来） ----
+  async function renderJm(jm) {
+    S.parent = S.tab === 'jobs' ? '#/jobs' : S.tab === 'library' ? '#/' : '#/search';
+    const a = await api(`/api/jm/album/${jm}`);
+    const multi = a.chapters.length > 1;
+
+    const act = (label, cls, fn) => el('button', {
+      class: cls,
+      onclick: async (e) => {
+        const btn = e.currentTarget;
+        btn.disabled = true;
+        try { await fn(); } catch (err) { toast(err.message); }
+        render();
+      },
+    }, label);
+    const actions = el('div', { class: 'actions' });
+    if (a.archivedChapters > 0) {
+      actions.append(el('button', { class: 'primary', onclick: async () => go(await continueTarget(jm)) }, '在线阅读'));
+    }
+    if (a.state === 'archiving') {
+      actions.append(el('button', { class: 'secondary', disabled: true }, '入库中…'));
+    } else if (a.state !== 'archived') {
+      const label = a.state === 'partial' ? `补齐入库（已入库 ${a.archivedChapters}/${a.chapters.length} 章）` : '入库';
+      actions.append(act(label, a.archivedChapters ? 'secondary' : 'primary', async () => {
+        const r = await api('/api/jm/archive', { jmIds: [jm] });
+        toast(r.queued ? '已加入入库队列，进度见“任务”' : '已经入库了');
+      }));
+    }
+    if (!a.fav) {
+      actions.append(act('收藏', 'secondary', async () => {
+        const r = await api('/api/jm/favorite', { jmIds: [jm] });
+        toast(NEXT_TEXT[r.next] || '已收藏');
+      }));
+    } else if (a.inLibrary) {
+      actions.append(el('button', { class: 'secondary', onclick: () => go(`#/a/${jm}`) }, '在书架中打开，管理收藏夹'));
+    }
+
+    const stateText = { archived: '已入库', archiving: '入库中', partial: `部分入库（${a.archivedChapters}/${a.chapters.length} 章）` }[a.state] || '未入库';
+    const pdfText = { done: '已生成', running: '生成中' }[a.pdf] || (a.fav ? '等入库完成后生成' : '收藏后自动生成');
+    app.replaceChildren(el('div', { class: 'album' },
+      el('div', { class: 'album-head' },
+        el('div', { class: 'cover' }, el('img', { src: jmCoverUrl(jm), alt: '' })),
+        el('div', {},
+          el('h2', {}, a.title),
+          el('p', { class: 'muted' }, `JM${jm}`),
+          a.authors.length ? el('p', { class: 'muted' }, a.authors.join('、')) : null,
+          a.works.length ? el('p', { class: 'muted' }, a.works.join('、')) : null,
+          el('p', { class: 'muted' }, `${a.chapters.length} 章 · ${a.pageCount || '-'} 页`))),
+      a.tags.length ? el('p', { class: 'muted small' }, a.tags.join(' · ')) : null,
+      actions,
+      el('p', { class: 'muted small' }, `状态：${stateText}　收藏：${a.fav ? a.folders.join('、') : '未收藏'}　PDF：${pdfText}`),
+      multi ? el('h3', {}, `章节（${a.chapters.length}）`) : null,
+      multi ? el('ol', { class: 'chapters' }, a.chapters.slice(0, 200).map((c) =>
+        el('li', {}, el('div', { class: 'chapter-row' },
+          el('span', { class: 'name' }, `第 ${c.sort} 章  ${c.title}`))))) : null));
+
+    // 入库或生成 PDF 进行中时，每 5 秒刷新一次状态
+    if (a.state === 'archiving' || a.pdf === 'running') {
+      const timer = setInterval(async () => {
+        try {
+          const b = await api(`/api/jm/album/${jm}`);
+          if (b.state !== a.state || b.pdf !== a.pdf || b.archivedChapters !== a.archivedChapters) render();
+        } catch (e) { /* 下次再试 */ }
+      }, 5000);
+      S.cleanup = () => clearInterval(timer);
+    }
+  }
+
+  // ---- 任务 ----
+  const STATUS_TEXT = { queued: '排队中', running: '进行中', done: '完成', failed: '失败' };
+  const KIND_TEXT = { archive: '入库', favorite: '收藏 PDF' };
+
+  async function renderJobs() {
+    S.tab = 'jobs';
+    const head = el('p', { class: 'muted small jobs-head' });
+    const list = el('ol', { class: 'chapters jobs' });
+    app.replaceChildren(tabsBar('jobs'), head, list);
+    const draw = (d) => {
+      head.textContent = d.running || d.queued ? `进行中 ${d.running} 个，排队 ${d.queued} 个，每 3 秒自动刷新` : '当前没有进行中的任务';
+      if (!d.items.length) {
+        list.replaceChildren(el('li', {}, el('p', { class: 'notice' }, '还没有任务。')));
+        return;
+      }
+      list.replaceChildren(...d.items.map((j) => {
+        const status = j.status === 'queued' && j.retryAt ? '等待重试' : (STATUS_TEXT[j.status] || j.status);
+        const time = new Date(j.updatedAt * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+        const detail = j.status === 'failed' ? j.error : j.status === 'done' ? '' : j.step;
+        return el('li', {}, el('a', { class: 'job', href: `#/jm/${j.jmId}` },
+          el('div', { class: 'grow' },
+            el('div', { class: 'name' }, `${KIND_TEXT[j.kind] || j.kind} · JM${j.jmId}`),
+            j.title ? el('div', { class: 'muted small clip' }, j.title) : null,
+            detail ? el('div', { class: j.status === 'failed' ? 'small err' : 'small muted' }, detail) : null),
+          el('div', { class: 'job-side' }, el('span', { class: `pill ${j.status}` }, status), el('span', { class: 'muted small' }, time))));
+      }));
+    };
+    draw(await api('/api/jobs'));
+    const timer = setInterval(async () => {
+      try { draw(await api('/api/jobs')); } catch (e) { /* 下次再试 */ }
+    }, 3000);
+    S.cleanup = () => clearInterval(timer);
   }
 
   // ---- 阅读 ----

@@ -15,7 +15,6 @@ from .fmt import clip, esc, size_text, text_table
 log = logging.getLogger(__name__)
 
 PER_VIEW = 10
-ALBUM_CACHE_TTL = 600
 
 HELP = """<b>JMComic 书库</b>
 
@@ -51,7 +50,6 @@ class Bot:
         self._searches: dict[int, dict] = {}
         self._multi: dict[int, list[int]] = {}
         self._jm_data: dict[int, dict] = {}
-        self._albums: dict[int, tuple[float, dict]] = {}
         self._photos: dict[int, object] = {}
 
     def register(self):
@@ -74,12 +72,7 @@ class Bot:
         return row["role"] if row else None
 
     async def _album(self, jm_id: int, fresh: bool = False) -> dict:
-        hit = self._albums.get(jm_id)
-        if hit and not fresh and time.time() - hit[0] < ALBUM_CACHE_TTL:
-            return hit[1]
-        album = await self.jm.album(jm_id)
-        self._albums[jm_id] = (time.time(), album)
-        return album
+        return await self.jm.album(jm_id, fresh)
 
     # ---- 消息 ----
     async def on_message(self, event):
@@ -297,19 +290,11 @@ class Bot:
             await event.answer("列表已过期，请重新发送 JM 号", alert=True)
             return
         if favorite:
-            folder = self.db.default_folder(uid)
-            self.worker.queue_jm_push(uid, [j for j in jm_ids if not self.db.is_favorited(uid, j)])
-            for jm_id in jm_ids:
-                self.db.add_to_folder(folder, jm_id)
-                self.worker.save_meta(jm_id)
-            archive = [j for j in jm_ids if not self.db.fully_archived(j)]
-            pdf = [j for j in jm_ids if self.db.fully_archived(j) and not self.db.pdf_record(j)]
-            batch = await self.worker.start_batch(uid, f"批量收藏 {len(jm_ids)} 本", archive, pdf)
+            batch = await self.worker.favorite_many(uid, jm_ids)
             await event.answer("已全部收藏" + ("，进度见新消息" if batch else ""))
         else:
-            archive = [j for j in jm_ids if not self.db.fully_archived(j)]
-            batch = await self.worker.start_batch(uid, f"批量入库 {len(archive)} 本", archive, [])
-            await event.answer("已加入队列，进度见新消息" if batch else "都已经入库或正在入库")
+            queued = await self.worker.archive_many(uid, jm_ids)
+            await event.answer("已加入队列，进度见新消息" if queued else "都已经入库或正在入库")
 
     # ---- JM 收藏夹同步 ----
     async def _jmsync_start(self, event, uid):

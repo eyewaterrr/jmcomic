@@ -134,3 +134,34 @@ body.reading { background: #000; }
 .check { display: flex; gap: 10px; align-items: center; padding: 11px 14px; }
 .check + .check { border-top: 1px solid rgba(127, 127, 127, .15); }
 .check input { width: 18px; height: 18px; accent-color: var(--btn); }
+
+/* 顶部标签 */
+.tabs {
+  position: sticky; top: 0; z-index: 20; display: flex; background: var(--bg);
+  border-bottom: 1px solid rgba(127, 127, 127, .18);
+}
+.tabs button { flex: 1; padding: 12px 0 10px; background: transparent; color: var(--hint); font-size: 15px; border-bottom: 2px solid transparent; }
+.tabs button.on { color: var(--text); font-weight: 600; border-bottom-color: var(--btn); }
+.sub { padding: 0 12px; font-size: 12px; color: var(--hint); text-align: right; }
+.seg { margin-top: 10px; }
+.cover .badge.right { left: auto; right: 6px; }
+
+/* 搜索 */
+.searchbar { display: flex; gap: 8px; align-items: flex-start; padding: 12px 12px 4px; }
+.search-input { resize: none; min-height: 40px; max-height: 120px; line-height: 1.4; }
+.search-info { padding: 0 12px; margin: 6px 0; }
+.bulk { padding-top: 2px; }
+.chapter-row { padding: 12px 14px; }
+
+/* 任务 */
+.jobs-head { padding: 10px 12px 0; margin: 0 0 8px; }
+.jobs { margin: 0 12px 24px; }
+.job { display: flex; gap: 10px; align-items: center; padding: 11px 14px; }
+.job .grow { flex: 1; min-width: 0; }
+.job-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: none; }
+.clip { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.err { color: #d93025; }
+.pill { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--bg); color: var(--hint); }
+.pill.running { background: var(--btn); color: var(--btn-text); }
+.pill.failed { color: #d93025; }
+.pill.done { color: var(--hint); }

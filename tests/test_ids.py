@@ -29,6 +29,9 @@ def test_urls():
     assert extract("https://18comic.vip/album/1485198/some-title") == [("album", 1485198)]
     assert extract("看这个 18comic.org/photo/350234") == [("photo", 350234)]
     assert extract("https://jmcomic-zzz.one/album/123456 和 JM234567") == [("album", 123456), ("album", 234567)]
+    # 按输入顺序排列，链接不会被提到最前面
+    assert extract("JM111111 18comic.vip/album/222222 JM333333") == [
+        ("album", 111111), ("album", 222222), ("album", 333333)]
 
 
 def test_keywords_are_not_ids():
