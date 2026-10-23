@@ -188,9 +188,9 @@ class Worker:
             im.save(thumb, "JPEG", quality=80)
 
     # ---- 入库 ----
-    def _caption(self, title: str, jm_id: int, detail: str, meta: str) -> str:
-        return (f"<b>[JM{jm_id}] {esc(clip(title, 300))}</b>\n{esc(detail)}\n"
-                f"#JM{jm_id}\n<code>meta: {meta} v=1</code>")
+    def _caption(self, title: str, jm_id: int, detail: str) -> str:
+        # 只放给人看的内容；JM 号、章节号等机器信息在 CBZ 的 ComicInfo.xml 和 PDF 元数据里
+        return f"<b>[JM{jm_id}] {esc(clip(title, 300))}</b>\n{esc(detail)}\n#JM{jm_id}"
 
     def _read_button(self, param: str):
         if not self.cfg.public_url:
@@ -231,10 +231,8 @@ class Worker:
             else:
                 detail = f"{len(pages)} 页 · {size_text(size)}"
                 name = f"[JM{jm_id}] {clip(album['title'], 80)}.cbz"
-            meta = (f"jm={jm_id} photo={ch['photo_id']} ep={i}/{total} sort={ch['sort']} "
-                    f"pages={len(pages)} sha256={sha}")
             msg = await self.storage.send_document(
-                self.storage.channel, cbz, self._caption(album["title"], jm_id, detail, meta),
+                self.storage.channel, cbz, self._caption(album["title"], jm_id, detail),
                 _file_name(name), thumb=thumb, buttons=self._read_button(f"c{ch['photo_id']}"),
                 progress=self._progress(job, label))
             self.db.add_chapter(jm_id, ch["photo_id"], ch["sort"], ch["title"], msg.id, size, sha, pages)
@@ -267,6 +265,7 @@ class Worker:
         await self._status(job, "转换 PDF", force=True)
         authors = json.loads(album["authors"])
         spec = {
+            "jm_id": jm_id,
             "out_dir": str(workdir / "pdf"),
             "name": _file_name(f"[JM{jm_id}] {clip(album['title'], 80)}"),
             "title": album["title"], "author": ", ".join(authors),
@@ -289,9 +288,8 @@ class Worker:
             label = f"卷 {k}/{len(volumes)}，" if len(volumes) > 1 else ""
             detail = (f"PDF · {len(chapters)} 章 · {vol['pages']} 页 · {size_text(size)}"
                       + (f" · 卷 {k}/{len(volumes)}" if len(volumes) > 1 else ""))
-            meta = f"jm={jm_id} kind=pdf vol={k}/{len(volumes)} pages={vol['pages']} sha256={sha}"
             msg = await self.storage.send_document(
-                self.storage.fav_channel, path, self._caption(album["title"], jm_id, detail, meta),
+                self.storage.fav_channel, path, self._caption(album["title"], jm_id, detail),
                 path.name, thumb=thumb, buttons=self._read_button(f"a{jm_id}"),
                 progress=self._progress(job, label))
             msg_ids.append(msg.id)

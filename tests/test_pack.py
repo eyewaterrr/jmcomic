@@ -33,6 +33,28 @@ def test_build_cbz_offsets_point_at_page_bytes(tmp_path):
     assert pages[0].name == "0001.webp"
 
 
+def test_pdf_volumes_and_metadata(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    images = make_images(tmp_path / "img", 4)
+    album = {"jm_id": 7, "title": "测试", "authors": [], "works": [], "tags": [],
+             "chapters": [{"photo_id": 7, "sort": 1, "title": "x"}]}
+    cbz = tmp_path / "a.cbz"
+    pack.build_cbz(images, cbz, pack.comicinfo_xml(album, album["chapters"][0], 4))
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "jm_id": 7, "out_dir": str(tmp_path / "pdf"), "name": "[JM7] 测试", "title": "测试", "author": "A",
+        "quality": 85, "volume_bytes": 1, "cbz": [str(cbz)],
+    }))
+    out = subprocess.run([sys.executable, "-m", "jmshelf.pdf", str(spec)], capture_output=True, text=True, check=True)
+    volumes = json.loads(out.stdout.strip().splitlines()[-1])["volumes"]
+    assert [v["pages"] for v in volumes] == [1, 1, 1, 1]
+    first = open(volumes[0]["path"], "rb").read()
+    assert first.startswith(b"%PDF") and b"jm=7 vol=1/4 pages=1" in first
+
+
 def test_list_images_sorted_and_filtered(tmp_path):
     make_images(tmp_path / "img", 3)
     (tmp_path / "img" / "notes.txt").write_text("x")

@@ -45,6 +45,7 @@ def main():
         target = out_dir / (f"{spec['name']}.pdf" if len(volumes) == 1 else f"{spec['name']} 卷{i}.pdf")
         with open(target, "wb") as f:
             img2pdf.convert(files, outputstream=f, title=spec["title"], author=spec["author"],
+                            subject=f"jm={spec['jm_id']} vol={i}/{len(volumes)} pages={len(files)}",
                             creator="jmshelf", producer="img2pdf")
         for p in files:
             Path(p).unlink()
