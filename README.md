@@ -23,12 +23,13 @@
 | `jmshelf/webapp/` | Mini App 前端 |
 | `jmshelf/fetch.py`、`jmshelf/pdf.py` | 两个子进程：下载图片、生成 PDF |
 | `jmshelf/pack.py` | CBZ 打包和每页偏移 |
+| `jmshelf/remote.py` | 远程下载机：大章节在多核服务器上下载、打包，CBZ 经 SSH 传回 |
 | `jmshelf/db.py` | SQLite 索引：书目、收藏夹、PDF 记录、任务、进度 |
 | `jmshelf/ids.py` | 从消息里识别 JM 号：链接、各种前缀、全角数字、多个号码 |
 | `jmshelf/sync.py` | JM 账号收藏夹到本地收藏夹的单向镜像 |
 | `jmshelf/meta.py` | 每本作品的元数据 JSON：导出、恢复 |
 | `jmshelf/selftest.py` | jmcomic 自检，供自动更新使用 |
-| `deploy/` | systemd 服务、jmcomic 自动更新（脚本、timer、path）、安装脚本、nginx 模板、配置示例 |
+| `deploy/` | systemd 服务、jmcomic 自动更新（脚本、timer、path）、安装脚本（含远程下载机）、nginx 模板、配置示例 |
 | `tests/` | 单元测试，运行 `python -m pytest` |
 
 ## 一、最终目的

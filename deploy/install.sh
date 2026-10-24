@@ -45,4 +45,7 @@ done
 systemctl daemon-reload
 systemctl enable --now jmcomic-update.timer jmcomic-update.path >/dev/null 2>&1 || true
 echo "安装完成。启动或重启：sudo systemctl restart jmcomic；查看日志：journalctl -u jmcomic -f"
+if grep -q '^JM_REMOTE_HOST=.' "$ETC/jmcomic.env"; then
+    echo "已配置远程下载机：改动了 fetch.py、pack.py、remote.py 时，再运行 sudo deploy/remote-install.sh"
+fi
 echo "jmcomic 自动更新：每天 04:30 检查（jmcomic-update.timer），手动检查：sudo systemctl start jmcomic-update"

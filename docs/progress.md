@@ -11,6 +11,7 @@ JM 账号已配置，登录测试通过；账号里收藏的 14 本已全部入�
 1. 在手机上验收 v1.1。
 2. 在 BotFather 里启用 Main Mini App。
 3. 需要时打开 `/jmsync` 里的开关：“每天自动同步”和“反向同步到 JM”默认都是关的。
+4. 启用远程下载机：运行 `sudo deploy/remote-install.sh`，按提示填写 `JM_REMOTE_HOST`、`JM_REMOTE_PORT`（见 operations.md 第 13 节）。
 
 | 功能 | 状态 |
 | --- | --- |
@@ -82,4 +83,4 @@ JM 账号已配置，登录测试通过；账号里收藏的 14 本已全部入�
 | jmcomic 版本 | `>=2.7.10,<3`，同一大版本内自动升级 |
 | `/jmsync` | 保持现状：同步的作品放进“JM·”收藏夹，等于收藏，会生成 PDF。不加“只入库”选项；只想入库时用 `enqueue-batch` |
 | 反向同步到 JM | 有这个功能，默认关闭，开关由所有者在 `/jmsync` 里控制；只加不删 |
-| 分布式下载 | 不做，维持单机后台排队；需要更快时给本机加 CPU 核心（见 environment.md 第 9 节） |
+| 分布式下载 | 估算达到 30MB 的章节交给新加坡 Oracle ARM（4 核）处理，其余在本机；远程失败时回到本机（见 architecture.md 第 13 节、environment.md 第 9 节） |

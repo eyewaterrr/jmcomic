@@ -14,6 +14,8 @@
 | `/var/lib/jmcomic/work/` | 任务临时目录 |
 | `/var/lib/jmcomic/meta/` | 每本作品一份元数据 JSON，用于迁移和恢复 |
 | `/var/lib/jmcomic/update-status.json` | 最近一次 jmcomic 自动更新的结果 |
+| `/var/lib/jmcomic/remote_key`、`remote_known_hosts` | 连接远程下载机的专用密钥和固定的主机公钥 |
+| `/var/lib/jmcomic/remote.sock` | 到远程下载机的 SSH 主连接，空闲 10 分钟后自动断开 |
 | `/etc/systemd/system/jmcomic.service` | 服务，以系统用户 `jmcomic` 运行 |
 | `/etc/systemd/system/jmcomic-update.{service,timer,path}` | jmcomic 自动更新，脚本在 `/opt/jmcomic/bin/jmcomic-update.sh` |
 | `/etc/nginx/sites-available/jmcomic` | 阅读页站点，由 `deploy/nginx-jmcomic.conf` 生成 |
@@ -40,6 +42,8 @@ sudo systemctl restart jmcomic
 - 把代码复制到 `/opt/jmcomic`，并安装依赖。
 - 不会覆盖已有的配置文件。
 - 不会自动重启服务，所以要手动执行上面的 restart。
+
+改动了 `jmshelf/fetch.py`、`pack.py` 或 `remote.py` 时，还要运行 `sudo deploy/remote-install.sh`，把代码同步到远程下载机（第 13 节）。
 
 ## 4. 在新服务器上安装
 
@@ -132,7 +136,7 @@ sudo rm /etc/nginx/sites-enabled/jmcomic /etc/nginx/sites-available/jmcomic && s
 | 已预取的页 | 0.08–0.11 秒 | 0.06–0.09 秒 |
 | 跳读未预取的页 | 0.17 秒 | 0.16–0.30 秒 |
 
-**速度瓶颈：** 下载并解码约 0.5 秒/页。单核 CPU 解码是瓶颈，多开线程也不会更快。
+**速度瓶颈：** 下载并解码约 0.5 秒/页。单核 CPU 解码是瓶颈，多开线程也不会更快。大章节已交给远程下载机，见第 13 节。
 
 **内存：** 常驻约 90MB；入库、收藏时整个服务的峰值 255–374MB（含子进程）；上限设为 900MB。
 
@@ -180,3 +184,33 @@ sudo systemctl disable --now jmcomic-update.timer jmcomic-update.path
 2. 在 Bot 里发 `/jmsync`，看过统计后点“开始同步”。
 3. 想每天自动同步，在 `/jmsync` 的消息里打开开关即可。
 4. “反向同步到 JM”的开关也在同一条消息里，默认关闭。打开后，你在这边新收藏的作品会自动加进 JM 账号的默认收藏，只加不删。
+
+## 13. 远程下载机
+
+估算达到 `JM_REMOTE_MIN_MB`（默认 30MB）的章节交给远程下载机处理，设计见 [architecture.md](architecture.md) 第 13 节。
+
+**安装或更新：** root 要能用一个管理别名登录下载机（默认 `oracle-sg`）。
+
+```bash
+sudo deploy/remote-install.sh oracle-sg
+```
+
+脚本依次完成：
+
+1. 生成 jmcomic 用户的专用密钥。
+2. 把代码装到下载机的 `~/jmshelf-worker`，jmcomic、Pillow 版本与本机一致。
+3. 在下载机的 authorized_keys 里加一行强制命令，限定这把密钥只能运行下载。
+4. 记录下载机的主机公钥，检查连接，打印需要填写的配置。
+
+把打印出的 `JM_REMOTE_HOST`、`JM_REMOTE_PORT` 填进 `/etc/jmcomic/jmcomic.env`，再重启服务。
+
+**检查连接：** 正常会输出 `ok jmcomic <版本> python <版本>`。
+
+```bash
+sudo -u jmcomic ssh -F none -p <端口> -i /var/lib/jmcomic/remote_key -o IdentitiesOnly=yes \
+    -o UserKnownHostsFile=/var/lib/jmcomic/remote_known_hosts <用户@地址> check
+```
+
+**日志：** `journalctl -u jmcomic | grep 远程`。交给远程的章节记一行“由远程下载机处理：页数、大小、用时”；失败时记“远程处理失败，改在本机下载”和原因。
+
+**停用：** 清空 `JM_REMOTE_HOST` 并重启服务，所有章节回到本机处理。要彻底撤销，再删掉下载机 authorized_keys 里带 `jmshelf-worker/run.sh` 的那一行，以及 `~/jmshelf-worker` 目录。

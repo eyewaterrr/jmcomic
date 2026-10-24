@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import statistics
 import sys
 import time
 from datetime import datetime
@@ -22,7 +23,7 @@ from PIL import Image
 from telethon import Button
 from telethon.errors import MessageNotModifiedError
 
-from . import meta, pack, sync, ui
+from . import meta, pack, remote, sync, ui
 from .fmt import clip, esc, size_text
 
 log = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ BACKUP_KEEP = 3
 SYNC_INTERVAL = 24 * 3600
 UPDATE_REQUEST_INTERVAL = 6 * 3600
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+REMOTE_PROBE_PAGES = 8  # 下载到第几页时估算整章大小，决定是否交给远程下载机
 
 
 class JobError(Exception):
@@ -62,6 +64,7 @@ class Worker:
         self._last_batch: dict[int, float] = {}
         self._push_lock = asyncio.Lock()
         self.live: dict[int, dict] = {}  # 任务 ID → {"percent", "text"}，阅读页的进度条用
+        self._warming: asyncio.Task | None = None  # 预先连接远程下载机的后台任务
 
     # ---- 提交 ----
     async def submit(self, kind: str, jm_id: int, user_id: int, batch_id: int | None = None) -> tuple[str, int]:
@@ -316,6 +319,10 @@ class Worker:
             proc.kill()
             await proc.wait()
             raise RuntimeError(f"{args[0]} 超时")
+        except asyncio.CancelledError:  # 改由远程下载机处理时会取消本机下载
+            proc.kill()
+            await proc.wait()
+            raise
         if proc.returncode != 0:
             tail = err.decode(errors="replace").strip().splitlines()[-3:]
             raise RuntimeError(f"{args[0]} 出错：{' | '.join(tail)}")
@@ -371,6 +378,117 @@ class Worker:
             return None
         return [Button.url("在线阅读", ui.startapp_link(self.bot_username, param))]
 
+    async def _chapter_cbz(self, job, album: dict, ch: dict, workdir: Path, pages_expected: int,
+                           base: float, span: float, label: str) -> tuple[Path, list, str]:
+        """下载一章并打包成 CBZ，返回 (文件, 每页信息, SHA-256)。
+
+        先在本机下载。配置了远程下载机时，下载到第 REMOTE_PROBE_PAGES 页就按已下载页大小的中位数估算
+        整章，达到 JM_REMOTE_MIN_MB 就停下本机下载，交给远程下载机；远程失败时回到本机从头下载。
+        """
+        img_dir = workdir / str(ch["photo_id"])
+        cbz = workdir / f"{ch['photo_id']}.cbz"
+        estimate = await self._fetch_local(job, ch, img_dir, pages_expected, base, span, label, probe=True)
+        if estimate:
+            shutil.rmtree(img_dir, ignore_errors=True)
+            result = await self._fetch_remote(job, album, ch, cbz, estimate, pages_expected, base, span, label)
+            if result:
+                return cbz, *result
+            await self._fetch_local(job, ch, img_dir, pages_expected, base, span, label, probe=False)
+        images = pack.list_images(img_dir)
+        if not images:
+            raise RuntimeError("没有下载到图片")
+
+        self._set_live(job, base + span * 0.86, f"{label}打包 {len(images)} 页")
+        await self._status(job, f"{label}打包 {len(images)} 页", force=True)
+        info = pack.comicinfo_xml(album, ch, len(images))
+        pages, sha = await asyncio.to_thread(pack.build_cbz, images, cbz, info)
+        shutil.rmtree(img_dir, ignore_errors=True)
+        return cbz, pages, sha
+
+    async def _fetch_local(self, job, ch: dict, img_dir: Path, pages_expected: int,
+                           base: float, span: float, label: str, probe: bool) -> int | None:
+        """本机子进程下载一章的图片。probe 时估算整章达到远程界限就停下，返回估算的字节数。"""
+        watcher = asyncio.create_task(self._watch_download(job, img_dir, pages_expected, base, span, label))
+        fetch = asyncio.create_task(self._run_module(
+            ["jmshelf.fetch", str(ch["photo_id"]), str(img_dir), str(self.cfg.image_threads)],
+            cwd=img_dir.parent, timeout=3600))
+        try:
+            if probe and self.cfg.remote_host and pages_expected:
+                self._warming = asyncio.get_running_loop().create_task(self._warm_remote())
+                estimate = await self._estimate_bytes(fetch, img_dir, pages_expected)
+                if estimate is not None and estimate >= self.cfg.remote_min_mb * 1024 * 1024:
+                    return estimate
+            await fetch
+        except RuntimeError:
+            self._request_update_check()
+            raise
+        finally:
+            watcher.cancel()
+            fetch.cancel()  # 已经结束时不起作用；提前返回时杀掉下载子进程
+            await asyncio.gather(fetch, return_exceptions=True)
+        return None
+
+    async def _warm_remote(self):
+        """试下前几页的同时建好到远程下载机的 SSH 连接；失败不要紧，交给远程时会直接连。"""
+        try:
+            await remote.warm(self.cfg)
+        except Exception:
+            log.warning("预先连接远程下载机失败", exc_info=True)
+
+    @staticmethod
+    async def _estimate_bytes(fetch: asyncio.Task, img_dir: Path, pages_expected: int) -> int | None:
+        """等到已下载 REMOTE_PROBE_PAGES 页，按每页大小的中位数估算整章字节数；不到这么多页就下载完了返回 None。
+
+        用中位数是因为开头的封面、扉页常比正文小很多，用平均值会明显低估。Pillow 先建空文件、编码完再
+        一次写入，所以 0 字节的是还在编码的页，不算。
+        """
+        while not fetch.done():
+            files = pack.list_images(img_dir) if img_dir.exists() else []
+            sizes = [size for size in (p.stat().st_size for p in files) if size]
+            if len(sizes) >= REMOTE_PROBE_PAGES:
+                return int(statistics.median(sizes) * pages_expected)
+            await asyncio.wait({fetch}, timeout=0.5)
+        return None
+
+    async def _fetch_remote(self, job, album: dict, ch: dict, cbz: Path, estimate: int, pages_expected: int,
+                            base: float, span: float, label: str) -> tuple[list, str] | None:
+        """交给远程下载机处理一章，返回 (每页信息, SHA-256)。失败时记日志、返回 None，由本机重新下载。
+
+        进度条：远程下载按远程报告的页数走到这一章的 70%，传回按收到的字节数走到 86%（之后是上传）。
+        """
+        text = f"{label}约 {size_text(estimate)}，交给远程下载机处理"
+        self._set_live(job, base, text)
+        await self._status(job, text, force=True)
+
+        def on_progress(done: int):
+            frac = min(done / pages_expected, 1)
+            self._set_live(job, base + span * 0.7 * frac, f"{label}远程下载 {done}/{pages_expected} 页")
+
+        started = time.monotonic()
+        watcher = asyncio.create_task(self._watch_remote(job, cbz, estimate, base, span, label))
+        try:
+            await remote.fetch_cbz(self.cfg, album, ch, cbz, timeout=3600, on_progress=on_progress)
+            result = await asyncio.to_thread(pack.cbz_index, cbz)
+        except Exception as e:
+            log.warning("JM%s 章节 %s 远程处理失败，改在本机下载：%s", album["jm_id"], ch["photo_id"], e)
+            cbz.unlink(missing_ok=True)
+            await self._status(job, f"{label}远程处理失败，改在本机下载", force=True)
+            return None
+        finally:
+            watcher.cancel()
+        log.info("JM%s 章节 %s 由远程下载机处理：%s 页，%s，用时 %.0f 秒", album["jm_id"], ch["photo_id"],
+                 len(result[0]), size_text(cbz.stat().st_size), time.monotonic() - started)
+        return result
+
+    async def _watch_remote(self, job, cbz: Path, estimate: int, base: float, span: float, label: str):
+        """远程打包完开始传回后，本地文件才有内容；按收到的字节数和估算大小显示传回进度。"""
+        while True:
+            got = cbz.stat().st_size if cbz.exists() else 0
+            if got:
+                frac = min(got / estimate, 1)
+                self._set_live(job, base + span * (0.7 + 0.16 * frac), f"{label}传回 {size_text(got)}")
+            await asyncio.sleep(1)
+
     async def _archive(self, job, workdir: Path):
         jm_id = job["jm_id"]
         self._set_live(job, 0, "获取作品信息")
@@ -387,31 +505,11 @@ class Worker:
             base = (i - 1) * span
             label = f"第 {i}/{total} 章，" if total > 1 else ""
             await self._status(job, f"{label}下载图片", force=True)
-            img_dir = workdir / str(ch["photo_id"])
             try:
                 pages_expected = album["page_count"] if total == 1 else await self.jm.photo_pages(ch["photo_id"])
             except Exception:
                 pages_expected = 0
-            watcher = asyncio.create_task(self._watch_download(job, img_dir, pages_expected, base, span, label))
-            try:
-                await self._run_module(
-                    ["jmshelf.fetch", str(ch["photo_id"]), str(img_dir), str(self.cfg.image_threads)],
-                    cwd=workdir, timeout=3600)
-            except RuntimeError:
-                self._request_update_check()
-                raise
-            finally:
-                watcher.cancel()
-            images = pack.list_images(img_dir)
-            if not images:
-                raise RuntimeError("没有下载到图片")
-
-            self._set_live(job, base + span * 0.86, f"{label}打包 {len(images)} 页")
-            await self._status(job, f"{label}打包 {len(images)} 页", force=True)
-            cbz = workdir / f"{ch['photo_id']}.cbz"
-            info = pack.comicinfo_xml(album, ch, len(images))
-            pages, sha = await asyncio.to_thread(pack.build_cbz, images, cbz, info)
-            shutil.rmtree(img_dir, ignore_errors=True)
+            cbz, pages, sha = await self._chapter_cbz(job, album, ch, workdir, pages_expected, base, span, label)
             size = cbz.stat().st_size
 
             if total > 1:
