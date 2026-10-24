@@ -345,7 +345,7 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
             raise HTTPException(404, "没有这一页")
         reader.prefetch(photo_id, idx)
         return Response(data, media_type=MIME.get(ext, "application/octet-stream"),
-                        headers={"Cache-Control": "private, max-age=604800, immutable"})
+                        headers={"Cache-Control": "private, max-age=86400, immutable"})
 
     @app.get("/cover/{jm_id}")
     async def cover(jm_id: int, request: Request):
@@ -545,7 +545,7 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
     async def jm_cover(jm_id: int, request: Request):
         """封面：已入库的用本地封面，没入库的由服务器代取 JM 竖版封面并缓存（手机直连 JM 很慢）。"""
         auth(request)
-        headers = {"Cache-Control": "private, max-age=604800"}
+        headers = {"Cache-Control": "private, max-age=86400"}
         local = cfg.cover_dir / f"{jm_id}.jpg"
         if local.exists():
             return FileResponse(local, media_type="image/jpeg", headers=headers)
