@@ -363,7 +363,7 @@
   const jmCoverUrl = (jm) => `/jmcover/${jm}?t=${encodeURIComponent(S.token)}`;
 
   // ---- 搜索：下拉选择搜索方式，结果可排序；没有输入时显示排行榜和分类浏览 ----
-  const STEP = 10;
+  const STEP = 20;
   const SEARCH_BY = [['site', '关键词'], ['work', '作品'], ['author', '作者'], ['tag', '标签'], ['actor', '角色']];
   const ORDERS = [['mr', '最新'], ['mv', '最多观看'], ['mp', '最多图片'], ['tf', '最多点赞']];
   const TIMES = [['a', '全部时间'], ['t', '今天'], ['w', '本周'], ['m', '本月']];
@@ -420,8 +420,7 @@
     const info = el('p', { class: 'muted small search-info' });
     const bulk = el('div', { class: 'chips bulk' });
     const grid = el('div', { class: 'grid' });
-    const moreBtn = el('button', { class: 'secondary more-btn', onclick: () => showMore() }, '加载更多');
-    const end = el('p', { class: 'notice small' });
+    const end = el('p', { class: 'notice small' });  // 列表底部：滑到附近时自动加载下一批
 
     const chipRow = (list, active, pick) => el('div', { class: 'chips' }, list.map(([k, label]) =>
       el('button', { class: k === active ? 'chip on' : 'chip', onclick: () => pick(k) }, label)));
@@ -477,10 +476,9 @@
       }
       bulk.hidden = !bulk.childElementCount;
 
-      const shown = !!st.mode && st.items.length > 0;
-      moreBtn.hidden = !(shown && hasMore());
-      end.hidden = !(shown && !hasMore());
-      end.textContent = '没有更多了';
+      // 隐藏的元素不会触发 IntersectionObserver，所以有结果时底部一直留着，只换文字
+      end.hidden = !(st.mode && st.items.length);
+      end.textContent = hasMore() ? '' : '没有更多了';
     };
     const drawAll = () => {
       grid.replaceChildren(...st.items.slice(0, st.shown).map(searchCard));
@@ -530,6 +528,7 @@
       }
       grid.classList.remove('busy');
       loading = false;
+      fillScreen();
     };
 
     const run = (q) => {
@@ -556,12 +555,11 @@
       input.focus();
     };
 
-    // 每次多显示 10 本；当前一页看完了就取下一页（接口每页 80 条）
+    // 滑到接近底部时自动接上：每次多显示 20 本，当前一页看完了就取下一页（接口每页 80 条）
     const showMore = async () => {
-      if (loading) return;
+      if (loading || !st.mode || !hasMore()) return;
       loading = true;
-      moreBtn.disabled = true;
-      moreBtn.textContent = '加载中…';
+      end.textContent = '加载中…';
       try {
         if (st.shown + STEP > st.items.length && st.page < st.pages) {
           const d = await api(url(st.page + 1));
@@ -576,9 +574,13 @@
         toast(e.message);
       }
       loading = false;
-      moreBtn.disabled = false;
-      moreBtn.textContent = '加载更多';
       drawInfo();
+      fillScreen();
+    };
+    // 底部已经在视野附近时观察器不会再触发（状态没变），内容不够撑满屏幕就继续加载；
+    // 已经离开这个页面（底部不在文档里）就停，免得在后台一页页取下去
+    const fillScreen = () => {
+      if (hasMore() && end.isConnected && !end.hidden && end.getBoundingClientRect().top < innerHeight + 800) showMore();
     };
 
     const bulkAction = async (kind, jmIds) => {
@@ -603,11 +605,14 @@
     app.replaceChildren(tabsBar('search'),
       el('div', { class: 'searchbar' }, select, el('div', { class: 'input-wrap' }, input, clearBtn),
         el('button', { class: 'primary small', onclick: () => run(input.value) }, '搜索')),
-      filters, discover, info, bulk, grid, moreBtn, end);
+      filters, discover, info, bulk, grid, end);
     drawAll();
     if (st.pending) run(st.q);
     else if (st.items.length) S.scrollTo = st.scroll;
-    S.cleanup = () => { st.scroll = window.scrollY; };
+    const io = new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) showMore(); },
+      { rootMargin: '800px 0px' });
+    io.observe(end);
+    S.cleanup = () => { st.scroll = window.scrollY; io.disconnect(); };
   }
 
   // ---- 搜索页新版（预览）：页面上始终是一个结果列表 ----
@@ -757,8 +762,8 @@
       }
       loading = false;
       drawInfo();
-      // 内容还不够撑满屏幕时继续加载
-      if (hasMore() && end.getBoundingClientRect().top < innerHeight + 800) showMore();
+      // 内容还不够撑满屏幕时继续加载；已经离开这个页面就停
+      if (hasMore() && end.isConnected && end.getBoundingClientRect().top < innerHeight + 800) showMore();
     };
 
     const bulkAction = async (kind, jmIds) => {

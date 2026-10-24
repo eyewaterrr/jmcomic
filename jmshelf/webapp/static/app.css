@@ -168,7 +168,6 @@ body.reading { background: #000; }
 
 /* 作者搜索 */
 .link { color: var(--link); }
-.more-btn { display: block; width: calc(100% - 24px); margin: 4px 12px 20px; }
 
 /* 搜索方式下拉、清空按钮、筛选、发现 */
 .searchbar { align-items: center; }
