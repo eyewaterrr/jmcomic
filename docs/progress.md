@@ -11,7 +11,9 @@ JM 账号已配置，登录测试通过；账号里收藏的 14 本已全部入�
 1. 在手机上验收 v1.1。
 2. 在 BotFather 里启用 Main Mini App。
 3. 需要时打开 `/jmsync` 里的开关：“每天自动同步”和“反向同步到 JM”默认都是关的。
-4. 启用远程下载机：运行 `sudo deploy/remote-install.sh`，按提示填写 `JM_REMOTE_HOST`、`JM_REMOTE_PORT`（见 operations.md 第 13 节）。
+4. 准备 v3 大改动：取消入库，阅读直接从 JM 取、DMIT 只做缓存，收藏只记收藏夹，上传精选单独操作。方案见 [architecture-v3.md](architecture-v3.md)，实施前先确认其中第 13 节的待确认事项。
+
+远程下载机已在 2026-10-24 启用：估算达到 30MB 的章节交给新加坡 Oracle 处理（operations.md 第 13 节）。v3 里阅读不再使用它。
 
 | 功能 | 状态 |
 | --- | --- |

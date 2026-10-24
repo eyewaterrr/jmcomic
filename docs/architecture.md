@@ -1,5 +1,7 @@
 # 架构设计（v2 建议稿）
 
+> 本文描述的是现在线上运行的结构。下一次大改动（取消入库，阅读直接从 JM 取，DMIT 只做缓存）已经定下方案、尚未实施，见 [architecture-v3.md](architecture-v3.md)。
+
 本文根据目标服务器的实测结果（见 [environment.md](environment.md)）修订 README 初版规划。标“待确认”的地方需要项目负责人决定，汇总在 [progress.md](progress.md)。
 
 ## 1. 与初版规划的主要差异

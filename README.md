@@ -10,6 +10,7 @@
 > - 运维：[docs/operations.md](docs/operations.md)
 > - 进度：[docs/progress.md](docs/progress.md)
 > - 后续计划：[docs/roadmap.md](docs/roadmap.md)
+> - 下一次大改动（规划中，尚未实施）：取消入库，阅读直接从 JM 取、DMIT 只做缓存，见 [docs/architecture-v3.md](docs/architecture-v3.md)
 
 ## 代码结构
 
