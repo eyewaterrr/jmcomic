@@ -1,21 +1,22 @@
 # 运维手册
 
+适用于 v3（阅读从 JM 取、服务器只缓存原图）。设计见 [architecture.md](architecture.md)。
+
 ## 1. 文件位置
 
 | 位置 | 内容 |
 | --- | --- |
 | `/opt/jmcomic` | 代码（`jmshelf/`）和独立的 Python 环境（`venv/`） |
 | `/etc/jmcomic/jmcomic.env` | 配置和密钥，权限 640，属主 root:jmcomic；字段说明见 `deploy/jmcomic.env.example` |
-| `/var/lib/jmcomic` | 运行数据，详见下面几行 |
-| `/var/lib/jmcomic/jmshelf.db` | 索引数据库 |
+| `/var/lib/jmcomic/jmshelf.db` | 数据库 |
+| `/var/lib/jmcomic/jmshelf-pre-v3.db` | 从 v1.1 升级时自动留下的数据库备份 |
 | `/var/lib/jmcomic/bot.session` | Bot 登录凭证 |
-| `/var/lib/jmcomic/cache/` | 页面缓存，上限 1GB |
-| `/var/lib/jmcomic/covers/` | 封面 |
-| `/var/lib/jmcomic/work/` | 任务临时目录 |
+| `/var/lib/jmcomic/cache/pages/` | JM 原图缓存，上限 2GB，7 天没打开的章节删除 |
+| `/var/lib/jmcomic/cache/jmcovers/` | 搜索页封面缓存，最多 5000 张 |
+| `/var/lib/jmcomic/covers/` | 收藏和读过的作品的封面 |
+| `/var/lib/jmcomic/work/` | 上传精选时的临时目录，任务结束即删 |
 | `/var/lib/jmcomic/meta/` | 每本作品一份元数据 JSON，用于迁移和恢复 |
 | `/var/lib/jmcomic/update-status.json` | 最近一次 jmcomic 自动更新的结果 |
-| `/var/lib/jmcomic/remote_key`、`remote_known_hosts` | 连接远程下载机的专用密钥和固定的主机公钥 |
-| `/var/lib/jmcomic/remote.sock` | 到远程下载机的 SSH 主连接，空闲 10 分钟后自动断开 |
 | `/etc/systemd/system/jmcomic.service` | 服务，以系统用户 `jmcomic` 运行 |
 | `/etc/systemd/system/jmcomic-update.{service,timer,path}` | jmcomic 自动更新，脚本在 `/opt/jmcomic/bin/jmcomic-update.sh` |
 | `/etc/nginx/sites-available/jmcomic` | 阅读页站点，由 `deploy/nginx-jmcomic.conf` 生成 |
@@ -39,27 +40,55 @@ sudo systemctl restart jmcomic
 
 `install.sh` 的行为：
 
-- 把代码复制到 `/opt/jmcomic`，并安装依赖。
+- 把代码复制到 `/opt/jmcomic`，安装依赖，更新 systemd 单元。
 - 不会覆盖已有的配置文件。
 - 不会自动重启服务，所以要手动执行上面的 restart。
 
-改动了 `jmshelf/fetch.py`、`pack.py` 或 `remote.py` 时，还要运行 `sudo deploy/remote-install.sh`，把代码同步到远程下载机（第 13 节）。
+## 4. 从 v1.1 升级到 v3
 
-## 4. 在新服务器上安装
+1. 部署新代码：
+
+   ```bash
+   cd ~/projects/jmcomic && git pull
+   sudo deploy/install.sh
+   ```
+
+2. 整理配置：运行 `sudo micro /etc/jmcomic/jmcomic.env`。
+   - 删掉 `TG_CHANNEL_ID`（书库频道不再使用），以及 `JM_REMOTE_` 开头的几行。留着也不影响运行。
+   - 如果写过 `JM_CACHE_MB=1024`，删掉这一行或改成 2048。
+3. 启动服务：
+
+   ```bash
+   sudo systemctl enable --now jmcomic jmcomic-update.timer
+   ```
+
+4. 看日志确认迁移完成：运行 `journalctl -u jmcomic -n 30`。服务启动时会自动完成以下几件事，过程见 architecture.md 第 14 节：
+   - 先备份数据库为 `jmshelf-pre-v3.db`，再迁移；
+   - 重新导出元数据；
+   - 删除旧的页面缓存。
+5. 在 Bot 里发 `/status`，确认缓存和流量这两行都有数字。
+
+**升级后不再需要的东西：**
+
+- 书库频道里 v1.1 的帖子和 `#backup` 备份文件：留着不影响，要清理就在 Telegram 里手动删。Bot 删不了 48 小时以前的消息。
+- 远程下载机：v3 不再使用。要彻底撤销，在下载机上删掉 `~/.ssh/authorized_keys` 里带 `jmshelf-worker/run.sh` 的那一行，以及 `~/jmshelf-worker` 目录。本机的 `/var/lib/jmcomic/remote_key*`、`remote_known_hosts` 也可以删掉。
+- 回退：停服务，把 `jmshelf-pre-v3.db` 复制回 `jmshelf.db`，部署 v1.1 的代码（git 标签或提交 `bd67d25`），再启动。
+
+## 5. 在新服务器上安装
 
 1. 运行 `sudo deploy/install.sh`，它会生成 `/etc/jmcomic/jmcomic.env`。
-2. 编辑这个文件，填入 Token、api_id/api_hash、两个频道 ID、所有者 ID 和阅读页网址。
+2. 编辑这个文件，填入 Token、api_id/api_hash、精选频道 ID、所有者 ID 和阅读页网址。
 3. 建 nginx 站点：
    1. 把 `deploy/nginx-jmcomic.conf` 里的域名和证书路径换成实际值；
    2. 放到 `sites-available/jmcomic`，再链接到 `sites-enabled`；
    3. 运行 `nginx -t` 检查配置，然后 reload。
 4. 在 Cloudflare 新增阅读页子域名，开启代理。
 5. 运行 `sudo systemctl enable --now jmcomic` 启动服务。
-6. 在 BotFather 里设置 Main Mini App，步骤见第 5 节。
+6. 在 BotFather 里设置 Main Mini App，步骤见第 6 节。
 
-## 5. BotFather 设置 Main Mini App
+## 6. BotFather 设置 Main Mini App
 
-书库频道和精选频道的每条帖子都带一个“在线阅读”按钮。按钮的链接形如 `https://t.me/<bot>?startapp=c<章节ID>`，要先启用 Main Mini App 才能打开阅读页。启用步骤：
+精选频道的每条帖子都带一个“在线阅读”按钮，链接形如 `https://t.me/<bot>?startapp=a<JM号>`。要先启用 Main Mini App 才能打开阅读页：
 
 1. 在 @BotFather 里发送 `/mybots`，选择这个 Bot。
 2. 依次进入 Bot Settings → Configure Mini App → Enable Mini App。
@@ -67,50 +96,40 @@ sudo systemctl restart jmcomic
 
 私聊里的“在线阅读”按钮和左下角的“书架”菜单不受影响，不设置也能用。
 
-## 6. 运维子命令
+## 7. 运维子命令
 
-服务运行时也可以用下面的命令直接建任务，任务由服务里的队列执行，进度消息会发到所有者的私聊：
-
-```bash
-sudo -u jmcomic bash -c 'set -a; . /etc/jmcomic/jmcomic.env; cd /opt/jmcomic && \
-  JM_DATA_DIR=/var/lib/jmcomic venv/bin/python -m jmshelf enqueue archive 123456'
-```
-
-批量入库多个 JM 号的命令如下。它会自动去重，跳过已经入库或已在队列里的作品，所有任务共用一条进度消息；只入库，不会收藏：
+服务运行时也能直接建上传精选任务。任务由服务里的队列执行，进度消息发到所有者的私聊；已上传的和已在队列里的自动跳过：
 
 ```bash
 sudo -u jmcomic bash -c 'set -a; . /etc/jmcomic/jmcomic.env; cd /opt/jmcomic && \
-  JM_DATA_DIR=/var/lib/jmcomic venv/bin/python -m jmshelf enqueue-batch archive 123456 234567'
+  JM_DATA_DIR=/var/lib/jmcomic venv/bin/python -m jmshelf enqueue publish 123456 234567'
 ```
 
-把 `archive` 换成 `favorite`，就是生成 PDF。这只生成 PDF，不会把作品放进收藏夹；要收藏，请在 Bot 或书架里操作。
+元数据的导出和恢复也用子命令，见第 8 节。
 
-元数据的导出和恢复也用子命令，见第 7 节。
+## 8. 备份与恢复
 
-## 7. 备份与恢复
+**数据库：** 服务器的整机备份包含 `jmshelf.db` 的在线快照和 `/etc/jmcomic`。服务本身不再往 Telegram 发备份。
 
-**自动备份：** 服务每 24 小时生成一份数据库快照，gzip 压缩后发到书库频道，带 `#backup` 标签，只保留最近 3 份。
-
-**恢复步骤：**
+**恢复数据库：**
 
 1. 停止服务：`sudo systemctl stop jmcomic`。
-2. 从频道下载最新的备份。
-3. 解压后放到 `/var/lib/jmcomic/jmshelf.db`。
-4. 修改属主：`sudo chown jmcomic: /var/lib/jmcomic/jmshelf.db`。
-5. 启动服务：`sudo systemctl start jmcomic`。
+2. 把备份里的数据库放到 `/var/lib/jmcomic/jmshelf.db`。
+3. 修改属主：`sudo chown jmcomic: /var/lib/jmcomic/jmshelf.db`。
+4. 启动服务：`sudo systemctl start jmcomic`。
 
-**元数据文件：** 每本作品在 `/var/lib/jmcomic/meta/JM<号>.json` 另存一份元数据，入库、生成 PDF、收藏夹变化时自动更新。
-
-迁移到新服务器时，把整个 `meta/` 目录（加上 `covers/`）拷过去，停服务后运行：
+**元数据文件：** 每本作品在 `/var/lib/jmcomic/meta/JM<号>.json` 另存一份，收藏夹变化、上传精选、补元数据时自动更新。迁移到新服务器时，把整个 `meta/` 目录（加上 `covers/`）拷过去，停服务后运行：
 
 ```bash
 sudo -u jmcomic bash -c 'set -a; . /etc/jmcomic/jmcomic.env; cd /opt/jmcomic && \
   JM_DATA_DIR=/var/lib/jmcomic venv/bin/python -m jmshelf restore-meta /var/lib/jmcomic/meta'
 ```
 
-`export-meta` 会从数据库重新生成全部 JSON。
+`export-meta` 会从数据库重新生成全部 JSON。v1.1 格式的旧文件也能恢复。
 
-## 8. 撤销安装
+原图缓存不用备份：丢了会在阅读时重新从 JM 取。
+
+## 9. 撤销安装
 
 先停掉并删除服务，再删掉 nginx 站点：
 
@@ -122,47 +141,46 @@ sudo rm /etc/nginx/sites-enabled/jmcomic /etc/nginx/sites-available/jmcomic && s
 
 数据、配置和代码分别在 `/var/lib/jmcomic`、`/etc/jmcomic`、`/opt/jmcomic`，确认不再需要后再删除。
 
-## 9. 实测数据（2026-10-24）
+## 10. 实测数据（2026-11-08，v3）
 
-两本作品的完整流程测试结果：
+在本机用真实的 JM 和迁移后的数据库副本测试，Telegram 上传换成了桩：
 
-| 项目 | JM1485198（53 页） | JM1475699（57 页） |
-| --- | --- | --- |
-| 入库 | 约 60 秒（含排队） | 43 秒：排队 8 秒、下载 31 秒、打包加上传 4 秒 |
-| 入库后的 CBZ | 28MB | 22.7MB |
-| 收藏 | 约 6 秒 | 9 秒：取回 2 秒、转 PDF 3 秒、上传 2 秒 |
-| 收藏的 PDF | 30MB | 26.2MB |
-| 第 1 页（首次读取） | 0.49 秒 | 0.17 秒 |
-| 已预取的页 | 0.08–0.11 秒 | 0.06–0.09 秒 |
-| 跳读未预取的页 | 0.17 秒 | 0.16–0.30 秒 |
+| 项目 | 结果 |
+| --- | --- |
+| 打开一章（364 页，取章节详情和作品详情） | 0.29 秒 |
+| 第 1 页（缓存里没有，现从 JM 取） | 0.16 秒 |
+| 第 2 页（已被预读） | 0.02 秒 |
+| 缓存命中 | 3 毫秒 |
+| 预读 | 打开后几秒内往后 20 页都在缓存里 |
+| 上传精选，13 页单章 | PDF 6MB |
+| 上传精选，8 章 455 页 | 补图加生成 PDF 约 40 秒，PDF 101MB，单卷 |
+| 服务器还原一页（只在生成 PDF 时） | 解码加 WebP 重新压缩约 160 毫秒；阅读时不做 |
 
-**速度瓶颈：** 下载并解码约 0.5 秒/页。单核 CPU 解码是瓶颈，多开线程也不会更快。大章节已交给远程下载机，见第 13 节。
+**原图和 v1.1 的 CBZ：** 同一章 8 页抽样，v1.1 保存的 WebP（质量 90）是 JM 原图的 1.31 倍。
 
-**内存：** 常驻约 90MB；入库、收藏时整个服务的峰值 255–374MB（含子进程）；上限设为 900MB。
+**同一张图 JM 每次给的字节可能不同：** CDN 有时返回不同的编码，尺寸相同，还原后平均只差约 1/255（压缩噪声）。还原算法和 jmcomic 逐像素一致，见单元测试。
 
-**图片质量：** 按 WebP 质量 90 保存。
-
-## 10. 测试阅读页接口
+## 11. 测试阅读页接口
 
 阅读页在 Cloudflare 后面。Cloudflare 会把 Python 自带请求库（urllib）这类非浏览器请求当成爬虫，直接返回 403。
 
 - 手动测试接口时用 curl。
 - 手机里 Telegram 打开阅读页用的是正常浏览器，不受影响。
 
-## 11. jmcomic 自动更新
+## 12. jmcomic 自动更新
 
 **什么时候检查：**
 
 - 每天 04:30 自动检查。
-- 下载出错时也会立即检查一次，6 小时内最多一次。
+- 从 JM 下载出错时也会立即检查一次，6 小时内最多一次。
 
 **有新版本时：** 自动完成升级。
 
-1. 停服务、升级。
-2. 自检，内容包括搜索、取详情、下载并解码两张图片。
+1. 等正在执行的任务结束，停服务、升级。
+2. 自检：搜索、取详情、下载两张原图并还原。
 3. 自检通过就启动服务；不通过就装回原版本再启动。
 
-**大版本：** 只私聊提醒，不自动升级。规则详见 architecture.md 第 12 节。
+**大版本：** 只私聊提醒，不自动升级。规则详见 architecture.md 第 13 节。
 
 ```bash
 sudo systemctl start jmcomic-update                # 立即检查一次
@@ -178,39 +196,15 @@ sudo -u jmcomic bash -c 'cd /opt/jmcomic && venv/bin/python -m jmshelf.selftest'
 sudo systemctl disable --now jmcomic-update.timer jmcomic-update.path
 ```
 
-## 12. JM 收藏夹同步
+## 13. JM 收藏夹同步
 
 1. 运行 `sudo micro /etc/jmcomic/jmcomic.env`，填写 `JM_USERNAME` 和 `JM_PASSWORD`，保存后运行 `sudo systemctl restart jmcomic`。
-2. 在 Bot 里发 `/jmsync`，看过统计后点“开始同步”。
+2. 在 Bot 里发 `/jmsync`，看过统计后点“开始同步”。同步只改“JM·”收藏夹，不下载、不生成 PDF。
 3. 想每天自动同步，在 `/jmsync` 的消息里打开开关即可。
 4. “反向同步到 JM”的开关也在同一条消息里，默认关闭。打开后，你在这边新收藏的作品会自动加进 JM 账号的默认收藏，只加不删。
 
-## 13. 远程下载机
+## 14. 缓存和流量
 
-估算达到 `JM_REMOTE_MIN_MB`（默认 30MB）的章节交给远程下载机处理，设计见 [architecture.md](architecture.md) 第 13 节。
-
-**安装或更新：** root 要能用一个管理别名登录下载机（默认 `oracle-sg`）。
-
-```bash
-sudo deploy/remote-install.sh oracle-sg
-```
-
-脚本依次完成：
-
-1. 生成 jmcomic 用户的专用密钥。
-2. 把代码装到下载机的 `~/jmshelf-worker`，jmcomic、Pillow 版本与本机一致。
-3. 在下载机的 authorized_keys 里加一行强制命令，限定这把密钥只能运行下载。
-4. 记录下载机的主机公钥，检查连接，打印需要填写的配置。
-
-把打印出的 `JM_REMOTE_HOST`、`JM_REMOTE_PORT` 填进 `/etc/jmcomic/jmcomic.env`，再重启服务。
-
-**检查连接：** 正常会输出 `ok jmcomic <版本> python <版本>`。
-
-```bash
-sudo -u jmcomic ssh -F none -p <端口> -i /var/lib/jmcomic/remote_key -o IdentitiesOnly=yes \
-    -o UserKnownHostsFile=/var/lib/jmcomic/remote_known_hosts <用户@地址> check
-```
-
-**日志：** `journalctl -u jmcomic | grep 远程`。交给远程的章节记一行“由远程下载机处理：页数、大小、用时”；失败时记“远程处理失败，改在本机下载”和原因。
-
-**停用：** 清空 `JM_REMOTE_HOST` 并重启服务，所有章节回到本机处理。要彻底撤销，再删掉下载机 authorized_keys 里带 `jmshelf-worker/run.sh` 的那一行，以及 `~/jmshelf-worker` 目录。
+- `/status` 显示缓存大小、缓存的章节数、这次启动以来从 JM 下载的量，以及服务的入站、出站流量（systemd IPAccounting）。
+- 调整缓存：在配置里改 `JM_CACHE_MB`（上限）、`JM_CACHE_DAYS`（多少天没打开就删）、`JM_READ_AHEAD`（预读页数），然后重启服务。
+- 手动清空缓存：停服务后删掉 `/var/lib/jmcomic/cache/pages/` 下的目录，再启动。

@@ -1,14 +1,18 @@
-"""在主进程里调用 jmcomic 做搜索、取详情、下载封面（都很轻，放在线程里跑）。"""
+"""在主进程里调用 jmcomic：搜索、取作品和章节详情、下载封面和原图（都只是网络请求，放在线程里跑）。
+
+v3 里服务器不解码图片：只下载 JM 原图，阅读页用 Canvas 还原（images.py、webapp/static/strips.js）。
+"""
 import asyncio
 import threading
 import time
 from pathlib import Path
 
 import jmcomic
-from jmcomic import JmcomicText
+from jmcomic import JmcomicText, JmImageTool
 
 jmcomic.disable_jm_log()
 ALBUM_TTL = 600
+CHAPTER_TTL = 3600  # 章节详情里有图片地址和打乱参数，缓存 1 小时
 
 # 搜索方式 → JM 接口的 main_tag
 SEARCH_BY = {"site": 0, "work": 1, "author": 2, "tag": 3, "actor": 4}
@@ -30,11 +34,15 @@ class JM:
     def __init__(self):
         self._client = None
         self._lock = threading.Lock()
+        self._init_lock = threading.Lock()
         self._albums: dict[int, tuple[float, dict]] = {}
+        self._chapters: dict[int, tuple[float, dict]] = {}
 
     def _cl(self):
         if self._client is None:
-            self._client = jmcomic.JmOption.construct({"client": {"impl": "api"}}).new_jm_client()
+            with self._init_lock:  # 下载图片不拿接口锁，客户端只能建一次
+                if self._client is None:
+                    self._client = jmcomic.JmOption.construct({"client": {"impl": "api"}}).new_jm_client()
         return self._client
 
     @staticmethod
@@ -135,13 +143,36 @@ class JM:
                     failed.append((jm_id, str(e)[:120]))
         return {"added": added, "skipped": skipped, "failed": failed}
 
-    def _photo_pages(self, photo_id: int) -> int:
+    def _chapter(self, photo_id: int) -> dict:
         with self._lock:
-            return len(self._cl().get_photo_detail(str(photo_id), False, False))
+            photo = self._cl().get_photo_detail(str(photo_id), False, True)
+        pages = []
+        for i in range(len(photo)):
+            img = photo[i]
+            suffix = (img.img_file_suffix or ".webp").lower()
+            num = 0 if img.is_gif else JmImageTool.get_num_by_detail(img)
+            pages.append({"url": img.download_url, "num": num, "ext": suffix})
+        return {"photo_id": int(photo.photo_id), "jm_id": int(photo.album_id), "title": photo.name,
+                "sort": photo.album_index, "pages": pages}
 
-    async def photo_pages(self, photo_id: int) -> int:
-        """一章有多少页（入库时用来算下载进度）。"""
-        return await asyncio.to_thread(self._photo_pages, photo_id)
+    async def chapter(self, photo_id: int, fresh: bool = False) -> dict:
+        """章节详情：所属作品、每页的图片地址、扩展名和打乱参数 num（阅读页按它还原）。缓存 1 小时。"""
+        hit = self._chapters.get(photo_id)
+        if hit and not fresh and time.time() - hit[0] < CHAPTER_TTL:
+            return hit[1]
+        chapter = await asyncio.to_thread(self._chapter, photo_id)
+        self._chapters[photo_id] = (time.time(), chapter)
+        return chapter
+
+    def forget_chapter(self, photo_id: int):
+        """图片取不到时丢掉缓存的章节详情（图片地址可能变了），下次重新取。"""
+        self._chapters.pop(photo_id, None)
+
+    def image_bytes(self, url: str) -> bytes:
+        """下载一张原图（不解码）。不占用接口锁：jmcomic 的客户端本来就支持多线程下载图片。"""
+        resp = self._cl().get_jm_image(url)
+        resp.require_success()
+        return resp.content
 
     async def photo_album(self, photo_id: int) -> int:
         return await asyncio.to_thread(self._photo_album, photo_id)
@@ -161,7 +192,7 @@ class JM:
         return await asyncio.to_thread(self._browse, page, category, order, time_range)
 
     async def album(self, jm_id: int, fresh: bool = False) -> dict:
-        """作品详情，缓存 10 分钟（Bot 和书架共用）；入库时用 fresh=True 取最新章节。"""
+        """作品详情，缓存 10 分钟（Bot 和书架共用）；上传精选时用 fresh=True 取最新章节。"""
         hit = self._albums.get(jm_id)
         if hit and not fresh and time.time() - hit[0] < ALBUM_TTL:
             return hit[1]

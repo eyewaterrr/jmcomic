@@ -1,16 +1,18 @@
-"""Mini App 后端：身份校验、书架 / 作品 / 章节接口、按页图片（磁盘缓存 + 预取）、阅读进度。"""
+"""Mini App 后端：身份校验、书架 / 作品 / 章节接口、按页原图（JM → 服务器缓存 → 手机）、阅读进度、搜索。
+
+v3：图片直接从 JM 取，服务器只缓存原图、不解码；阅读页按章节接口给的 num 用 Canvas 还原。
+"""
 import asyncio
 import hashlib
 import hmac
 import json
 import logging
-import os
 import time
 import urllib.parse
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import ids
@@ -21,9 +23,9 @@ log = logging.getLogger(__name__)
 WEBAPP_DIR = Path(__file__).parent / "webapp"
 TOKEN_TTL = 12 * 3600
 INIT_DATA_TTL = 24 * 3600
-PREFETCH_PAGES = 6
 JM_COVER_LIMIT = 5000
 MIME = {".webp": "image/webp", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif"}
+IMAGE_CACHE = "private, max-age=86400, immutable"
 
 
 # ---- 身份 ----
@@ -75,111 +77,22 @@ def read_token(key: bytes, token: str, now: float | None = None) -> int | None:
     return None
 
 
-# ---- 页面缓存 ----
-class PageCache:
-    """按页的磁盘缓存，超过上限时删掉最久没用过的文件，降到上限的 90%。"""
-
-    def __init__(self, root: Path, max_bytes: int):
-        self.root = root
-        self.max_bytes = max_bytes
-        self.total = sum(p.stat().st_size for p in root.rglob("*") if p.is_file()) if root.exists() else 0
-
-    def _path(self, photo_id: int, idx: int, ext: str) -> Path:
-        return self.root / str(photo_id) / f"{idx:04d}{ext}"
-
-    def get(self, photo_id: int, idx: int, ext: str) -> bytes | None:
-        path = self._path(photo_id, idx, ext)
-        try:
-            data = path.read_bytes()
-            os.utime(path)
-            return data
-        except FileNotFoundError:
-            return None
-
-    def has(self, photo_id: int, idx: int, ext: str) -> bool:
-        return self._path(photo_id, idx, ext).exists()
-
-    def put(self, photo_id: int, idx: int, ext: str, data: bytes):
-        path = self._path(photo_id, idx, ext)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_bytes(data)
-        tmp.replace(path)
-        self.total += len(data)
-        if self.total > self.max_bytes:
-            self._evict()
-
-    def _evict(self):
-        files = sorted((p for p in self.root.rglob("*") if p.is_file()), key=lambda p: p.stat().st_mtime)
-        self.total = sum(p.stat().st_size for p in files)
-        target = int(self.max_bytes * 0.9)
-        for p in files:
-            if self.total <= target:
-                break
-            size = p.stat().st_size
-            p.unlink(missing_ok=True)
-            self.total -= size
-
-
-class Reader:
-    """取单页：先查缓存，没有就从频道按区间读取；同一页的并发请求只读一次。"""
-
-    def __init__(self, db, storage, cache: PageCache):
-        self.db = db
-        self.storage = storage
-        self.cache = cache
-        self._inflight: dict[tuple[int, int], asyncio.Task] = {}
-        self._prefetch_sem = asyncio.Semaphore(3)
-
-    async def page(self, photo_id: int, idx: int) -> tuple[bytes, str]:
-        row = self.db.page(photo_id, idx)
-        if row is None:
-            raise KeyError
-        ext = Path(row["name"]).suffix.lower()
-        data = self.cache.get(photo_id, idx, ext)
-        if data is None:
-            data = await asyncio.shield(self._fetch(photo_id, idx, row, ext))
-        return data, ext
-
-    def _fetch(self, photo_id, idx, row, ext) -> asyncio.Task:
-        key = (photo_id, idx)
-        task = self._inflight.get(key)
-        if task is None:
-            task = asyncio.create_task(self._read(photo_id, idx, row, ext))
-            self._inflight[key] = task
-            task.add_done_callback(lambda _: self._inflight.pop(key, None))
-        return task
-
-    async def _read(self, photo_id, idx, row, ext) -> bytes:
-        chapter = self.db.chapter(photo_id)
-        data = await self.storage.read_range(chapter["msg_id"], row["offset"], row["size"])
-        self.cache.put(photo_id, idx, ext, data)
-        return data
-
-    def prefetch(self, photo_id: int, idx: int, count: int = PREFETCH_PAGES):
-        for n in range(idx + 1, idx + 1 + count):
-            row = self.db.page(photo_id, n)
-            if row is None:
-                break
-            ext = Path(row["name"]).suffix.lower()
-            if (photo_id, n) in self._inflight or self.cache.has(photo_id, n, ext):
-                continue
-            asyncio.create_task(self._prefetch_one(photo_id, n, row, ext))
-
-    async def _prefetch_one(self, photo_id, idx, row, ext):
-        async with self._prefetch_sem:
-            try:
-                await self._fetch(photo_id, idx, row, ext)
-            except Exception:
-                log.debug("预取 %s/%s 失败", photo_id, idx, exc_info=True)
+def page_list(chapter: dict, dims: list) -> list[list[int]]:
+    """阅读页用的每页信息：[num, 宽, 高]；尺寸还不知道时为 0（阅读页先用占位比例排版）。"""
+    out = []
+    for i, page in enumerate(chapter["pages"]):
+        size = dims[i] if i < len(dims) and dims[i] else (0, 0)
+        out.append([page["num"], size[0], size[1]])
+    return out
 
 
 # ---- 应用 ----
-def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
+def create_app(cfg, db, worker, cache, dims_recorder=None) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     key = hmac.new(b"jmshelf-session", cfg.bot_token.encode(), hashlib.sha256).digest()
     index_html = (WEBAPP_DIR / "index.html").read_text()
     version = str(int(max(p.stat().st_mtime for p in (WEBAPP_DIR / "static").iterdir())))
+    jm = worker.jm
 
     def auth(request: Request) -> int:
         header = request.headers.get("authorization", "")
@@ -197,6 +110,12 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
         if not isinstance(data, dict):
             raise HTTPException(400, "请求格式不对")
         return data
+
+    def jm_id_of(data: dict) -> int:
+        try:
+            return int(data.get("jmId"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "缺少参数")
 
     @app.middleware("http")
     async def no_store_api(request: Request, call_next):
@@ -229,62 +148,114 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
         return [{"id": f["id"], "name": f["name"], "source": f["source"], "default": bool(f["is_default"]),
                  "count": f["count"]} for f in db.folders(uid)]
 
+    def pick_state(jm_id: int) -> str:
+        if db.pick(jm_id):
+            return "done"
+        return "running" if db.active_job("publish", jm_id) else "none"
+
+    def pick_link(jm_id: int) -> str | None:
+        row = db.pick(jm_id)
+        return worker.storage.post_link(worker.storage.fav_channel_id, int(row["msg_ids"].split(",")[0])) if row else None
+
+    # ---- 书架 ----
     @app.get("/api/library")
     async def api_library(request: Request):
+        """收藏的作品 + 读过的作品。"""
         uid = auth(request)
-        progress = db.all_progress(uid)
         items = []
-        for a in db.albums(uid):
-            p = progress.get(a["jm_id"])
-            read = db.chapter(p["photo_id"]) if p else None
+        for a in db.shelf(uid):
+            read = db.chapter(a["p_photo"]) if a["p_photo"] else None
             folder_ids = [int(x) for x in a["folder_ids"].split(",")] if a["folder_ids"] else []
             items.append({
-                "jmId": a["jm_id"], "title": a["title"], "chapters": a["chapter_count"],
-                "archived": a["archived"], "pages": a["pages"], "fav": bool(folder_ids),
-                "folders": folder_ids, "pdf": bool(a["pdf"]),
-                "progress": {"sort": read["sort"], "page": p["page"]} if read else None,
-                "cover": (cfg.cover_dir / f"{a['jm_id']}.jpg").exists(),
+                "jmId": a["jm_id"], "title": a["title"], "chapters": a["chapter_count"], "pages": a["pages"],
+                "fav": bool(folder_ids), "folders": folder_ids, "pick": bool(a["pick"]),
+                "progress": {"photoId": a["p_photo"], "page": a["p_page"], "sort": read["sort"] if read else 1}
+                if a["p_photo"] else None,
             })
         return {"items": items, "folders": folder_list(uid)}
 
+    # ---- 作品（书架里的和搜索结果里的是同一个页面） ----
+    def album_from_db(jm_id: int) -> dict | None:
+        row = db.album(jm_id)
+        if row is None or not row["title"]:
+            return None
+        return {"jm_id": jm_id, "title": row["title"], "authors": json.loads(row["authors"] or "[]"),
+                "works": json.loads(row["works"] or "[]"), "tags": json.loads(row["tags"] or "[]"),
+                "page_count": 0,
+                "chapters": [{"photo_id": c["photo_id"], "sort": c["sort"], "title": c["title"]}
+                             for c in db.chapters(jm_id)]}
+
     @app.get("/api/album/{jm_id}")
-    async def api_album(jm_id: int, request: Request):
+    async def api_album(jm_id: int, request: Request, fresh: int = 0):
         uid = auth(request)
-        album = db.album(jm_id)
-        if album is None:
-            raise HTTPException(404, "书库里没有这本")
-        p = db.progress(uid, jm_id)
+        offline = False
+        try:
+            a = await jm.album(jm_id, bool(fresh))
+            if db.album(jm_id):
+                db.upsert_album(a)  # 收藏或读过的作品顺便更新元数据
+        except Exception:
+            a = album_from_db(jm_id)
+            if a is None:
+                raise HTTPException(404, f"找不到 JM{jm_id}，或者暂时取不到详情")
+            offline = True
+        known = {c["photo_id"]: c for c in db.chapters(jm_id)}
         member = {f["id"] for f in db.album_folders(uid, jm_id)}
+        p = db.progress(uid, jm_id)
         return {
-            "jmId": jm_id, "title": album["title"], "authors": json.loads(album["authors"]),
-            "tags": json.loads(album["tags"]), "chapterCount": album["chapter_count"],
+            "jmId": jm_id, "title": a["title"], "authors": a["authors"], "works": a["works"], "tags": a["tags"],
+            "pageCount": a["page_count"], "offline": offline,
+            "chapters": [{
+                "photoId": c["photo_id"], "sort": c["sort"], "title": c["title"],
+                "pages": known[c["photo_id"]]["page_count"] if c["photo_id"] in known else 0,
+                "cached": cache.cached_pages(c["photo_id"]),
+            } for c in a["chapters"]],
             "fav": bool(member),
             "folders": [dict(f, member=f["id"] in member) for f in folder_list(uid)],
-            "pdf": "done" if db.pdf_record(jm_id) else "running" if db.active_job("favorite", jm_id) else "none",
-            "cover": (cfg.cover_dir / f"{jm_id}.jpg").exists(),
-            "chapters": [{"photoId": c["photo_id"], "sort": c["sort"], "title": c["title"],
-                          "pages": c["page_count"]} for c in db.chapters(jm_id)],
+            "pick": pick_state(jm_id), "pickLink": pick_link(jm_id),
+            "pickProgress": worker.progress_for("publish", jm_id),
             "progress": {"photoId": p["photo_id"], "page": p["page"]} if p else None,
         }
 
     @app.post("/api/album/{jm_id}/folders")
     async def api_album_folders(jm_id: int, request: Request):
-        """设置作品在本地收藏夹里的归属。由不收藏变成收藏时自动安排入库或生成 PDF。"""
+        """设置作品在本地收藏夹里的归属（只改收藏夹，不触发任何任务）。"""
         uid = auth(request)
-        if db.album(jm_id) is None:
-            raise HTTPException(404, "书库里没有这本")
         was = db.is_favorited(uid, jm_id)
         try:
             wanted = {int(x) for x in (await body(request)).get("folderIds", [])}
             db.set_album_folders(uid, jm_id, wanted)
         except (TypeError, ValueError) as e:
             raise HTTPException(400, str(e) or "参数不对")
-        worker.save_meta(jm_id)
-        if not was and db.is_favorited(uid, jm_id):
+        now = db.is_favorited(uid, jm_id)
+        if now:
+            worker.remember(jm_id, jm.cached_album(jm_id))
+        if not was and now:
             worker.queue_jm_push(uid, [jm_id])
-        result = await worker.after_favorite(uid, jm_id) if db.is_favorited(uid, jm_id) else "none"
-        return {"ok": True, "fav": db.is_favorited(uid, jm_id), "next": result}
+        worker.save_meta(jm_id)
+        return {"ok": True, "fav": now}
 
+    @app.post("/api/favorite")
+    async def api_favorite(request: Request):
+        """收藏到默认收藏夹。"""
+        uid = auth(request)
+        await worker.favorite(uid, jm_id_of(await body(request)))
+        return {"ok": True}
+
+    @app.post("/api/unfavorite")
+    async def api_unfavorite(request: Request):
+        uid = auth(request)
+        jm_id = jm_id_of(await body(request))
+        db.unfavorite(uid, jm_id)
+        worker.save_meta(jm_id)
+        return {"ok": True}
+
+    @app.post("/api/publish")
+    async def api_publish(request: Request):
+        """上传精选：生成 PDF 发到精选频道。返回 done（已经上传过）/ created / exists。"""
+        uid = auth(request)
+        return {"result": await worker.publish(uid, jm_id_of(await body(request)))}
+
+    # ---- 收藏夹管理 ----
     @app.get("/api/folders")
     async def api_folders(request: Request):
         return {"folders": folder_list(auth(request))}
@@ -316,44 +287,71 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
             raise HTTPException(400, str(e))
         return {"folders": folder_list(uid)}
 
+    # ---- 阅读 ----
+    async def chapter_detail(photo_id: int) -> dict:
+        try:
+            return await jm.chapter(photo_id)
+        except Exception as e:
+            log.info("取章节 %s 失败：%s", photo_id, e)
+            raise HTTPException(502, "JM 暂时取不到这一章，请稍后再试")
+
     @app.get("/api/chapter/{photo_id}")
     async def api_chapter(photo_id: int, request: Request):
         uid = auth(request)
-        chapter = db.chapter(photo_id)
-        if chapter is None:
-            raise HTTPException(404, "没有这一章")
-        album = db.album(chapter["jm_id"])
-        siblings = [c["photo_id"] for c in db.chapters(chapter["jm_id"])]
+        ch = await chapter_detail(photo_id)
+        jm_id = ch["jm_id"]
+        try:
+            album = await jm.album(jm_id)
+            worker.remember(jm_id, album)
+            chapters = album["chapters"]
+            title = album["title"]
+        except Exception:
+            worker.remember(jm_id)
+            chapters = [{"photo_id": c["photo_id"], "sort": c["sort"], "title": c["title"]} for c in db.chapters(jm_id)]
+            row = db.album(jm_id)
+            title = row["title"] if row else ""
+        if not any(c["photo_id"] == photo_id for c in chapters):
+            chapters = [{"photo_id": photo_id, "sort": ch["sort"], "title": ch["title"]}]
+        db.set_chapter_pages(photo_id, len(ch["pages"]))
+        cache.touch(photo_id)
+        dims = db.chapter_dims(photo_id)
+        if dims_recorder and photo_id in dims_recorder.pending:
+            dims = dims + [None] * (len(ch["pages"]) - len(dims))
+            for n, size in dims_recorder.pending[photo_id].items():
+                if n <= len(dims):
+                    dims[n - 1] = size
+        siblings = [c["photo_id"] for c in chapters]
         pos = siblings.index(photo_id)
-        p = db.progress(uid, chapter["jm_id"])
+        me = chapters[pos]
+        p = db.progress(uid, jm_id)
         return {
-            "photoId": photo_id, "jmId": chapter["jm_id"], "albumTitle": album["title"],
-            "title": chapter["title"], "sort": chapter["sort"], "chapterCount": len(siblings),
-            "index": pos + 1,
+            "photoId": photo_id, "jmId": jm_id, "albumTitle": title,
+            "title": me["title"], "sort": me["sort"], "chapterCount": len(siblings), "index": pos + 1,
             "prev": siblings[pos - 1] if pos > 0 else None,
             "next": siblings[pos + 1] if pos + 1 < len(siblings) else None,
-            "pages": [[r["width"], r["height"]] for r in db.pages(photo_id)],
+            "pages": page_list(ch, dims),
             "page": p["page"] if p and p["photo_id"] == photo_id else 1,
         }
 
-    @app.get("/img/{photo_id}/{idx}")
-    async def img(photo_id: int, idx: int, request: Request):
+    @app.get("/img/{photo_id}/{n}")
+    async def img(photo_id: int, n: int, request: Request):
+        """一页 JM 原图（还没还原）。缓存里没有时先下载，超过 30 秒返回 503，阅读页稍后重试。"""
         auth(request)
-        try:
-            data, ext = await reader.page(photo_id, idx)
-        except KeyError:
+        ch = await chapter_detail(photo_id)
+        if not 1 <= n <= len(ch["pages"]):
             raise HTTPException(404, "没有这一页")
-        reader.prefetch(photo_id, idx)
-        return Response(data, media_type=MIME.get(ext, "application/octet-stream"),
-                        headers={"Cache-Control": "private, max-age=86400, immutable"})
-
-    @app.get("/cover/{jm_id}")
-    async def cover(jm_id: int, request: Request):
-        auth(request)
-        path = cfg.cover_dir / f"{jm_id}.jpg"
-        if not path.exists():
-            raise HTTPException(404, "没有封面")
-        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+        try:
+            path = await cache.page(photo_id, n, ch)
+        except asyncio.TimeoutError:
+            raise HTTPException(503, "这一页还没下好")
+        except Exception as e:
+            log.info("从 JM 取 %s/%s 失败：%s", photo_id, n, e)
+            jm.forget_chapter(photo_id)
+            worker.request_update_check()
+            raise HTTPException(502, "JM 暂时取不到这一页")
+        cache.read_ahead(photo_id, n, ch)
+        return FileResponse(path, media_type=MIME.get(path.suffix, "application/octet-stream"),
+                            headers={"Cache-Control": IMAGE_CACHE})
 
     @app.post("/api/progress")
     async def api_progress(request: Request):
@@ -364,7 +362,7 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
         except (KeyError, TypeError, ValueError):
             raise HTTPException(400, "缺少参数")
         chapter = db.chapter(photo_id)
-        if chapter is None or not 1 <= page <= chapter["page_count"]:
+        if chapter is None or page < 1 or (chapter["page_count"] and page > chapter["page_count"]):
             raise HTTPException(400, "页码不对")
         db.save_progress(uid, chapter["jm_id"], photo_id, page)
         return {"ok": True}
@@ -378,43 +376,13 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
         db.set_read_mode(uid, mode)
         return {"ok": True}
 
-    @app.post("/api/favorite")
-    async def api_favorite(request: Request):
-        """收藏到默认收藏夹；返回后续动作：archive（先入库）/ pdf（生成 PDF）/ done。"""
-        uid = auth(request)
-        try:
-            jm_id = int((await body(request)).get("jmId"))
-        except (TypeError, ValueError):
-            raise HTTPException(400, "缺少参数")
-        return {"next": await worker.favorite(uid, jm_id)}
-
-    @app.post("/api/unfavorite")
-    async def api_unfavorite(request: Request):
-        uid = auth(request)
-        try:
-            jm_id = int((await body(request)).get("jmId"))
-        except (TypeError, ValueError):
-            raise HTTPException(400, "缺少参数")
-        db.unfavorite(uid, jm_id)
-        worker.save_meta(jm_id)
-        return {"ok": True}
-
-    # ---- 搜索页、作品详情、任务页（和 Bot 对话的功能相同） ----
-    jm = worker.jm
+    # ---- 搜索页、任务页（和 Bot 对话的功能相同） ----
     cover_sem = asyncio.Semaphore(6)
     jm_cover_dir = cfg.cache_dir / "jmcovers"
 
-    def state_of(st: dict, chapter_total: int | None = None) -> str:
-        total = chapter_total or st["total"]
-        if st["archiving"]:
-            return "archiving"
-        if total and st["chapters"] >= total:
-            return "archived"
-        return "partial" if st["chapters"] else "none"
-
     def title_of(jm_id: int) -> str:
         row = db.album(jm_id)
-        if row:
+        if row and row["title"]:
             return row["title"]
         cached = jm.cached_album(jm_id)
         return cached["title"] if cached else ""
@@ -423,7 +391,7 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
         states = db.album_states(uid, [it["jmId"] for it in items])
         for it in items:
             st = states[it["jmId"]]
-            it.update(state=state_of(st), fav=st["fav"], pdf="done" if st["pdf"] else "running" if st["pdfJob"] else "none")
+            it.update(fav=st["fav"], pick="done" if st["pick"] else "running" if st["picking"] else "none")
         return items
 
     def id_list(data: dict) -> list[int]:
@@ -484,44 +452,12 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
         return {"mode": "browse", "items": decorate(uid, items), "total": res["total"],
                 "page": page, "pages": res["pages"]}
 
-    @app.get("/api/jm/album/{jm_id}")
-    async def api_jm_album(jm_id: int, request: Request, fresh: int = 0):
-        uid = auth(request)
-        try:
-            a = await jm.album(jm_id, bool(fresh))
-        except Exception:
-            raise HTTPException(404, f"找不到 JM{jm_id}，或者暂时取不到详情")
-        st = db.album_states(uid, [jm_id])[jm_id]
-        folders = [f["name"] for f in db.album_folders(uid, jm_id)]
-        return {
-            "jmId": jm_id, "title": a["title"], "authors": a["authors"], "works": a["works"], "tags": a["tags"],
-            "pageCount": a["page_count"],
-            "chapters": [{"photoId": c["photo_id"], "sort": c["sort"], "title": c["title"]} for c in a["chapters"]],
-            "state": state_of(st, len(a["chapters"])), "archivedChapters": st["chapters"],
-            "fav": bool(folders), "folders": folders, "inLibrary": db.album(jm_id) is not None,
-            "pdf": "done" if st["pdf"] else "running" if st["pdfJob"] else "none",
-            "progress": worker.progress_for("archive", jm_id),
-        }
-
-    @app.post("/api/jm/archive")
-    async def api_jm_archive(request: Request):
-        uid = auth(request)
-        jm_ids = id_list(await body(request))
-        if len(jm_ids) == 1:
-            if db.fully_archived(jm_ids[0]):
-                return {"queued": 0}
-            status, _ = await worker.submit("archive", jm_ids[0], uid)
-            return {"queued": 1 if status == "created" else 0}
-        return {"queued": await worker.archive_many(uid, jm_ids)}
-
     @app.post("/api/jm/favorite")
     async def api_jm_favorite(request: Request):
+        """一起收藏到默认收藏夹（多个 JM 号）。"""
         uid = auth(request)
-        jm_ids = id_list(await body(request))
-        if len(jm_ids) == 1:
-            return {"next": await worker.favorite(uid, jm_ids[0])}
-        await worker.favorite_many(uid, jm_ids)
-        return {"next": "batch"}
+        await worker.favorite_many(uid, id_list(await body(request)))
+        return {"ok": True}
 
     @app.get("/api/jobs")
     async def api_jobs(request: Request):
@@ -543,7 +479,7 @@ def create_app(cfg, db, worker, reader: Reader) -> FastAPI:
 
     @app.get("/jmcover/{jm_id}")
     async def jm_cover(jm_id: int, request: Request):
-        """封面：已入库的用本地封面，没入库的由服务器代取 JM 竖版封面并缓存（手机直连 JM 很慢）。"""
+        """封面：收藏或读过的用本地封面，其余由服务器代取 JM 竖版封面并缓存（手机直连 JM 很慢）。"""
         auth(request)
         headers = {"Cache-Control": "private, max-age=86400"}
         local = cfg.cover_dir / f"{jm_id}.jpg"

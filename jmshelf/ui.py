@@ -5,7 +5,7 @@ from telethon import Button, types
 
 from .fmt import clip, esc
 
-KIND_NAME = {"archive": "入库", "favorite": "收藏 PDF"}
+KIND_NAME = {"publish": "上传精选"}
 
 
 def webapp_button(cfg, text: str, query: str = ""):
@@ -25,25 +25,18 @@ def _names(value, width: int) -> str:
     return clip("、".join(items), width) if items else "-"
 
 
+def pick_link(storage, pick) -> str:
+    return storage.post_link(storage.fav_channel_id, int(pick["msg_ids"].split(",")[0]))
+
+
 def album_view(cfg, db, storage, album: dict, user_id: int) -> tuple[str, list]:
     """作品详情。album 是 jm.album() 的结果；文字控制在图片说明的 1024 字以内。"""
     jm_id = album["jm_id"]
     chapters = album["chapters"]
-    archived = {r["photo_id"]: r for r in db.chapters(jm_id)}
-    done = sum(1 for c in chapters if c["photo_id"] in archived)
     folders = db.album_folders(user_id, jm_id)
-    pdf = db.pdf_record(jm_id)
-    archive_job = db.active_job("archive", jm_id)
-    pdf_job = db.active_job("favorite", jm_id)
-
-    if archive_job:
-        state = "入库中"
-    elif done == 0:
-        state = "未入库"
-    elif done < len(chapters):
-        state = f"部分入库（{done}/{len(chapters)} 章）"
-    else:
-        state = "已入库"
+    pick = db.pick(jm_id)
+    picking = db.active_job("publish", jm_id)
+    progress = db.progress(user_id, jm_id)
 
     lines = [
         f"<b>{esc(clip(album['title'], 200))}</b>",
@@ -52,31 +45,28 @@ def album_view(cfg, db, storage, album: dict, user_id: int) -> tuple[str, list]:
         f"作品：{esc(_names(album['works'], 80))}",
         f"标签：{esc(_names(album['tags'], 200))}",
         f"章节：{len(chapters)}    页数：{album.get('page_count') or '-'}",
-        f"状态：{state}",
         "收藏：" + (esc(clip("已收藏（" + "、".join(f["name"] for f in folders) + "）", 120)) if folders else "未收藏"),
+        "精选：" + ("已上传" if pick else "上传中" if picking else "未上传"),
     ]
-    if folders or pdf or pdf_job:
-        lines.append("PDF：" + ("已生成" if pdf else "生成中" if pdf_job else "等入库完成后生成"))
+    if progress:
+        at = next((c for c in chapters if c["photo_id"] == progress["photo_id"]), None)
+        if at:
+            lines.append(f"读到：第 {at['sort']} 章 第 {progress['page']} 页" if len(chapters) > 1
+                         else f"读到：第 {progress['page']} 页")
 
     rows = []
     first = []
-    if done < len(chapters) and not archive_job:
-        first.append(Button.inline("入库", f"ar:{jm_id}"))
-    if done:
-        read = webapp_button(cfg, "在线阅读", f"?read={jm_id}")
-        if read:
-            first.append(read)
+    read = webapp_button(cfg, "继续阅读" if progress else "在线阅读", f"?read={jm_id}")
+    if read:
+        first.append(read)
     first.append(Button.inline("取消收藏", f"uf:{jm_id}") if folders else Button.inline("收藏", f"fv:{jm_id}"))
     rows.append(first)
+    if pick:
+        rows.append([Button.url("查看精选", pick_link(storage, pick))])
+    elif not picking:
+        rows.append([Button.inline("上传精选（生成 PDF 发到精选频道）", f"pb:{jm_id}")])
     authors = [Button.inline(f"作者：{clip(name, 16)}", f"au:{jm_id}:{i}") for i, name in enumerate(album["authors"][:2])]
     if authors:
         rows.append(authors)
-    links = []
-    if archived:
-        top = min(archived.values(), key=lambda r: r["sort"])
-        links.append(Button.url("书库帖子", storage.post_link(storage.channel_id, top["msg_id"])))
-    if pdf:
-        links.append(Button.url("PDF 帖子", storage.post_link(storage.fav_channel_id, int(pdf["msg_ids"].split(",")[0]))))
-    links.append(Button.inline("刷新", f"r:{jm_id}"))
-    rows.append(links)
+    rows.append([Button.inline("刷新", f"r:{jm_id}")])
     return "\n".join(lines), rows

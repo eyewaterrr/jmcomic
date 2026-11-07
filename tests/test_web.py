@@ -5,7 +5,7 @@ import time
 import urllib.parse
 
 from jmshelf.fmt import text_table
-from jmshelf.web import PageCache, check_init_data, make_token, read_token
+from jmshelf.web import check_init_data, make_token, page_list, read_token
 
 TOKEN = "123456:TEST-token"
 
@@ -50,14 +50,10 @@ def test_token_roundtrip_and_expiry():
     assert read_token(key, "garbage") is None
 
 
-def test_page_cache_evicts_oldest(tmp_path):
-    cache = PageCache(tmp_path, max_bytes=250)
-    for i in range(1, 4):
-        cache.put(1, i, ".webp", b"x" * 100)
-        time.sleep(0.01)
-    assert cache.total <= 225
-    assert cache.get(1, 1, ".webp") is None
-    assert cache.get(1, 3, ".webp") == b"x" * 100
+def test_page_list_fills_unknown_sizes_with_zero():
+    chapter = {"pages": [{"num": 10}, {"num": 0}, {"num": 4}]}
+    assert page_list(chapter, [[800, 1200], None]) == [[10, 800, 1200], [0, 0, 0], [4, 0, 0]]
+    assert page_list(chapter, []) == [[10, 0, 0], [0, 0, 0], [4, 0, 0]]
 
 
 def test_text_table_alignment():
