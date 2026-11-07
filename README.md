@@ -2,7 +2,7 @@
 
 以 Telegram 为入口的个人漫画书库：在 Bot 或 Mini App 里搜索、收藏、在线阅读，满意的作品“上传精选”成 PDF 存在 Telegram 里。
 
-> 当前状态：v3 已实现并测试（分支 `feat/v3`），等手机验收后部署。
+> 当前状态：v3 已于 2026-11-08 部署上线（分支 `feat/v3`，PR #4）。接下来要做的见 [docs/progress.md](docs/progress.md)。
 >
 > - v3 的变化：取消入库；阅读时服务器从 JM 取原图、只做缓存，手机上用 Canvas 还原；收藏只记收藏夹；上传精选单独操作。目标是减少服务器的双向计费流量，也不再让单核 CPU 解码。
 > - 设计：[docs/architecture.md](docs/architecture.md)
