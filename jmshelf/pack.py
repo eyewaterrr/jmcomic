@@ -67,17 +67,30 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def build_cbz(images: list[Path], out: Path, comicinfo: str) -> tuple[list[Page], str]:
+def write_cbz(images: list[Path], out: Path, comicinfo: str):
     names = [f"{i:04d}{p.suffix.lower()}" for i, p in enumerate(images, 1)]
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as zf:
         for name, src in zip(names, images):
             zf.write(src, name)
         zf.writestr(COMICINFO, comicinfo)
-    offsets = member_offsets(out)
+
+
+def cbz_index(path: Path) -> tuple[list[Page], str]:
+    """每页的偏移、长度和尺寸，以及整个文件的 SHA-256。远程下载机传回的 CBZ 也用它校验和建索引。"""
+    offsets = member_offsets(path)
     pages = []
-    for name, src in zip(names, images):
-        with Image.open(src) as im:
-            width, height = im.size
-        offset, size = offsets[name]
-        pages.append(Page(name, offset, size, width, height))
-    return pages, file_sha256(out)
+    with zipfile.ZipFile(path) as zf:
+        for name, (offset, size) in offsets.items():
+            if Path(name).suffix.lower() not in IMAGE_EXT:
+                continue
+            with zf.open(name) as f, Image.open(f) as im:
+                width, height = im.size
+            pages.append(Page(name, offset, size, width, height))
+    if not pages:
+        raise ValueError(f"{path.name} 里没有图片")
+    return pages, file_sha256(path)
+
+
+def build_cbz(images: list[Path], out: Path, comicinfo: str) -> tuple[list[Page], str]:
+    write_cbz(images, out, comicinfo)
+    return cbz_index(out)

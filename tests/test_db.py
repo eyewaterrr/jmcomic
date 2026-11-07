@@ -100,3 +100,17 @@ def test_meta_export_and_restore_roundtrip(db, tmp_path):
     fresh.ensure_owner(OWNER)
     assert meta.restore_all(fresh, meta.meta_dir(data_dir)) == 1
     assert fresh.album_meta(10) == db.album_meta(10)
+
+
+def test_album_states_for_search_results(db):
+    archive(db, 10)
+    archive(db, 20, chapters=2)
+    db.conn.execute("DELETE FROM chapters WHERE photo_id=21")  # 20 只入库了 1/2 章
+    db.add_pdf_record(10, [5], 1, "x", OWNER)
+    db.add_to_folder(db.default_folder(OWNER), 10)
+    db.add_job("archive", 30, OWNER, None)
+    states = db.album_states(OWNER, [10, 20, 30, 40])
+    assert states[10] == {"chapters": 1, "total": 1, "fav": True, "pdf": True, "archiving": False, "pdfJob": False}
+    assert (states[20]["chapters"], states[20]["total"]) == (1, 2)
+    assert states[30]["archiving"] and not states[40]["archiving"]
+    assert db.album_states(2, [10])[10]["fav"] is False

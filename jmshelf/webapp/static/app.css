@@ -134,3 +134,89 @@ body.reading { background: #000; }
 .check { display: flex; gap: 10px; align-items: center; padding: 11px 14px; }
 .check + .check { border-top: 1px solid rgba(127, 127, 127, .15); }
 .check input { width: 18px; height: 18px; accent-color: var(--btn); }
+
+/* 顶部标签 */
+.tabs {
+  position: sticky; top: 0; z-index: 20; display: flex; background: var(--bg);
+  border-bottom: 1px solid rgba(127, 127, 127, .18);
+}
+.tabs button { flex: 1; padding: 12px 0 10px; background: transparent; color: var(--hint); font-size: 15px; border-bottom: 2px solid transparent; }
+.tabs button.on { color: var(--text); font-weight: 600; border-bottom-color: var(--btn); }
+.sub { padding: 0 12px; font-size: 12px; color: var(--hint); text-align: right; }
+.seg { margin-top: 10px; }
+.cover .badge.right { left: auto; right: 6px; }
+
+/* 搜索 */
+.searchbar { display: flex; gap: 8px; align-items: flex-start; padding: 12px 12px 4px; }
+.search-input { resize: none; min-height: 40px; max-height: 120px; line-height: 1.4; }
+.search-info { padding: 0 12px; margin: 6px 0; }
+.bulk { padding-top: 2px; }
+.chapter-row { padding: 12px 14px; }
+
+/* 任务 */
+.jobs-head { padding: 10px 12px 0; margin: 0 0 8px; }
+.jobs { margin: 0 12px 24px; }
+.job { display: flex; gap: 10px; align-items: center; padding: 11px 14px; }
+.job .grow { flex: 1; min-width: 0; }
+.job-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: none; }
+.clip { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.err { color: #d93025; }
+.pill { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--bg); color: var(--hint); }
+.pill.running { background: var(--btn); color: var(--btn-text); }
+.pill.failed { color: #d93025; }
+.pill.done { color: var(--hint); }
+
+/* 作者搜索 */
+.link { color: var(--link); }
+
+/* 搜索方式下拉、清空按钮、筛选、发现 */
+.searchbar { align-items: center; }
+.by-select {
+  flex: none; height: 40px; padding: 0 28px 0 12px; border-radius: 8px; font: inherit; font-size: 14px;
+  border: 1px solid rgba(127, 127, 127, .3); background-color: var(--bg2); color: var(--text);
+  -webkit-appearance: none; appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 15px) 18px, calc(100% - 10px) 18px;
+  background-size: 5px 5px; background-repeat: no-repeat;
+}
+.input-wrap { position: relative; flex: 1; min-width: 0; display: flex; }
+.input-wrap .search-input { padding-right: 32px; }
+.clear-btn {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%); width: 24px; height: 24px;
+  border-radius: 12px; background: rgba(127, 127, 127, .25); color: var(--bg); font-size: 16px; line-height: 24px; padding: 0;
+}
+.filters { padding: 2px 0 0; }
+.filters .chips, .discover .chips { padding-bottom: 8px; }
+.discover { padding-top: 6px; }
+.discover h3 { font-size: 13px; color: var(--hint); font-weight: 500; margin: 8px 12px 6px; }
+
+.grid.busy { opacity: .45; pointer-events: none; transition: opacity .15s; }
+
+/* 新版搜索页：分类、排序两个下拉 */
+.pills { display: flex; gap: 8px; padding: 2px 12px 0; }
+.pill-select {
+  height: 34px; padding: 0 28px 0 12px; border-radius: 17px; font: inherit; font-size: 13px;
+  border: 0; background-color: var(--bg2); color: var(--text);
+  -webkit-appearance: none; appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 15px) 15px, calc(100% - 10px) 15px;
+  background-size: 5px 5px; background-repeat: no-repeat;
+}
+
+/* 入库进度条 */
+.progress-box { display: flex; flex-direction: column; gap: 6px; }
+.progress-btn {
+  position: relative; overflow: hidden; width: 100%; padding: 12px; border-radius: var(--radius);
+  font-size: 15px; font-weight: 600; background: var(--bg2); color: var(--text);
+}
+.progress-btn:disabled { opacity: 1; cursor: default; }
+.progress-btn .bar {
+  position: absolute; left: 0; top: 0; bottom: 0; width: var(--p, 0%);
+  background: var(--btn); opacity: .35; transition: width .8s ease;
+}
+.progress-btn.queued .bar { width: 100%; opacity: .12; animation: jm-pulse 1.6s ease-in-out infinite; }
+.progress-btn .label { position: relative; }
+.progress-text { margin: 0; }
+@keyframes jm-pulse { 50% { opacity: .28; } }
+.mini-bar { position: relative; height: 3px; margin-top: 6px; border-radius: 2px; overflow: hidden; background: rgba(127, 127, 127, .2); }
+.mini-bar::after { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: var(--p, 0%); background: var(--btn); }

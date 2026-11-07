@@ -1,12 +1,14 @@
 'use strict';
 // 书架 Mini App
-// 路由：#/ 书架，#/folders 收藏夹管理，#/a/<JM号> 作品，#/r/<章节ID>/<页码> 阅读
+// 路由：顶部标签 #/ 书架、#/search 搜索、#/jobs 任务；#/folders 收藏夹管理，#/a/<JM号> 书库里的作品，
+//       #/jm/<JM号> JM 作品详情（搜索结果），#/r/<章节ID>/<页码> 阅读
 // 启动参数：startapp=c<章节ID> 打开该章；startapp=a<JM号>、?read=<JM号> 从上次位置继续读这本
 (() => {
   const tg = window.Telegram && window.Telegram.WebApp;
   const app = document.getElementById('app');
   const toastEl = document.getElementById('toast');
-  const S = { token: '', user: null, cleanup: null, parent: null };
+  const S = { token: '', user: null, cleanup: null, parent: null, tab: 'library', search: null,
+    search2: null, pendingSearch: null, ui2: false };
 
   function el(tag, props = {}, ...children) {
     const node = document.createElement(tag);
@@ -97,6 +99,9 @@
     if (parts[0] === 'a' && parts[1]) return { view: 'album', jm: Number(parts[1]) };
     if (parts[0] === 'r' && parts[1]) return { view: 'reader', photo: Number(parts[1]), page: Number(parts[2]) || null };
     if (parts[0] === 'folders') return { view: 'folders' };
+    if (parts[0] === 'search') return { view: 'search' };
+    if (parts[0] === 'jobs') return { view: 'jobs' };
+    if (parts[0] === 'jm' && parts[1]) return { view: 'jm', jm: Number(parts[1]) };
     return { view: 'library' };
   }
 
@@ -113,16 +118,22 @@
     document.body.classList.remove('reading');
     themeDark(false);
     const route = parse();
-    window.scrollTo(0, 0);
+    // 新页面画好之后再滚动，避免旧页面先跳到顶部；需要恢复位置的页面自己设置 S.scrollTo，null 表示不动
+    S.scrollTo = 0;
     try {
       if (route.view === 'album') await renderAlbum(route.jm);
       else if (route.view === 'reader') await renderReader(route.photo, route.page);
       else if (route.view === 'folders') await renderFolders();
+      else if (route.view === 'search') await (S.ui2 ? renderSearchV2() : renderSearch());
+      else if (route.view === 'jobs') await renderJobs();
+      else if (route.view === 'jm') await renderJm(route.jm);
       else await renderLibrary();
     } catch (e) {
       notice(e.message || String(e));
     }
-    if (tg.BackButton) route.view === 'library' ? tg.BackButton.hide() : tg.BackButton.show();
+    if (S.scrollTo !== null) window.scrollTo(0, S.scrollTo);
+    const top = ['library', 'search', 'jobs'].includes(route.view);
+    if (tg.BackButton) top ? tg.BackButton.hide() : tg.BackButton.show();
   }
 
   // 从上次读到的位置继续读这本：返回要跳转的路由
@@ -141,6 +152,7 @@
   // ---- 书架 ----
   async function renderLibrary() {
     S.parent = null;
+    S.tab = 'library';
     const data = await api('/api/library');
     let filter = store.get('jm.filter', 'all');
     let folder = Number(store.get('jm.folder', '0')) || 0;
@@ -176,7 +188,7 @@
         : '书架是空的。在 Bot 里发送 JM 号或关键词，点“入库”后就会出现在这里。';
     };
     draw();
-    app.replaceChildren(el('div', { class: 'bar' }, el('h1', {}, '书架'), count), seg, chips, grid, empty);
+    app.replaceChildren(tabsBar('library'), seg, chips, el('div', { class: 'sub' }, count), grid, empty);
   }
 
   function card(it) {
@@ -277,8 +289,8 @@
         el('div', {},
           el('h2', {}, a.title),
           el('p', { class: 'muted' }, `JM${jm}`),
-          a.authors.length ? el('p', { class: 'muted' }, a.authors.join('、')) : null,
-          a.tags.length ? el('p', { class: 'muted' }, a.tags.join(' · ')) : null)),
+          a.authors.length ? searchLinks(a.authors, 'author') : null,
+          a.tags.length ? searchLinks(a.tags, 'tag') : null)),
       el('div', { class: 'actions' }, readBtn, favBtn),
       el('p', { class: 'muted small' }, member.length ? `收藏夹：${member.join('、')}` : '未收藏', `　PDF：${pdfText}`),
       el('h3', {}, missing > 0 ? `章节（已入库 ${a.chapters.length}/${a.chapterCount}）` : `章节（${a.chapters.length}）`),
@@ -337,6 +349,593 @@
         el('p', { class: 'muted small' }, '全部取消勾选就是取消收藏；精选频道里的 PDF 不会删除。'),
         save));
     document.body.append(bg);
+  }
+
+  // ---- 顶部标签 ----
+  const TABS = [['library', '书架', '#/'], ['search', '搜索', '#/search'], ['jobs', '任务', '#/jobs']];
+  function tabsBar(active) {
+    const tabs = TABS.map(([key, label, hash]) => [key, key === 'search' && S.ui2 ? '搜索·新版' : label, hash]);
+    return el('nav', { class: 'tabs' }, tabs.map(([key, label, hash]) =>
+      el('button', { class: key === active ? 'on' : '', onclick: () => { if (key !== active) go(hash); } }, label)));
+  }
+
+  const STATE_TEXT = { archived: '已入库', archiving: '入库中', partial: '部分入库' };
+  const jmCoverUrl = (jm) => `/jmcover/${jm}?t=${encodeURIComponent(S.token)}`;
+
+  // ---- 搜索：下拉选择搜索方式，结果可排序；没有输入时显示排行榜和分类浏览 ----
+  const STEP = 20;
+  const SEARCH_BY = [['site', '关键词'], ['work', '作品'], ['author', '作者'], ['tag', '标签'], ['actor', '角色']];
+  const ORDERS = [['mr', '最新'], ['mv', '最多观看'], ['mp', '最多图片'], ['tf', '最多点赞']];
+  const TIMES = [['a', '全部时间'], ['t', '今天'], ['w', '本周'], ['m', '本月']];
+  const RANKS = [['t', '日榜'], ['w', '周榜'], ['m', '月榜'], ['a', '总榜']];
+  const CATEGORIES = [['0', '全部'], ['doujin', '同人'], ['single', '单本'], ['short', '短篇'],
+    ['another', '其他'], ['hanman', '韩漫'], ['meiman', '美漫'], ['3D', '3D']];
+  const labelOf = (list, key) => (list.find(([k]) => k === key) || [key, key])[1];
+
+  const newSearch = (q = '', by = 'site') => ({
+    q, by, order: 'mr', time: 'a', browse: null,
+    mode: '', items: [], page: 0, pages: 0, total: 0, shown: STEP, scroll: 0, pending: !!q,
+  });
+
+  // 点作者、作品、标签：跳到搜索页按对应方式搜索
+  function searchBy(by, value) {
+    S.pendingSearch = { q: value, by };
+    go('#/search');
+  }
+
+  function searchLinks(values, by, cls = 'muted') {
+    const p = el('p', { class: cls });
+    values.forEach((value, i) => {
+      if (i) p.append(by === 'tag' ? ' · ' : '、');
+      p.append(el('a', { class: 'link', href: '#/search', onclick: (e) => { e.preventDefault(); searchBy(by, value); } }, value));
+    });
+    return p;
+  }
+
+  function searchCard(it) {
+    return el('a', { class: 'card', href: `#/jm/${it.jmId}`, 'data-jm': it.jmId },
+      el('div', { class: 'cover' },
+        el('img', { src: jmCoverUrl(it.jmId), loading: 'lazy', alt: '' }),
+        STATE_TEXT[it.state] ? el('span', { class: 'badge' }, STATE_TEXT[it.state]) : null,
+        it.fav ? el('span', { class: 'badge right' }, '已收藏') : null),
+      el('div', { class: 't' }, it.title || `JM${it.jmId}`),
+      el('div', { class: 'm' }, it.author ? `JM${it.jmId} · ${it.author}` : `JM${it.jmId}`));
+  }
+
+  async function renderSearch() {
+    S.tab = 'search';
+    if (S.pendingSearch) {
+      S.search = newSearch(S.pendingSearch.q, S.pendingSearch.by);
+      S.pendingSearch = null;
+    }
+    const st = S.search || (S.search = newSearch());
+    let loading = false;
+
+    const select = el('select', { class: 'by-select' },
+      SEARCH_BY.map(([k, label]) => el('option', { value: k, selected: k === st.by }, label)));
+    const input = el('textarea', { class: 'input search-input', rows: 1, value: st.q });
+    const clearBtn = el('button', { class: 'clear-btn', 'aria-label': '清空', onclick: () => reset() }, '×');
+    const filters = el('div', { class: 'filters' });
+    const discover = el('div', { class: 'discover' });
+    const info = el('p', { class: 'muted small search-info' });
+    const bulk = el('div', { class: 'chips bulk' });
+    const grid = el('div', { class: 'grid' });
+    const end = el('p', { class: 'notice small' });  // 列表底部：滑到附近时自动加载下一批
+
+    const chipRow = (list, active, pick) => el('div', { class: 'chips' }, list.map(([k, label]) =>
+      el('button', { class: k === active ? 'chip on' : 'chip', onclick: () => pick(k) }, label)));
+    const hasMore = () => st.shown < st.items.length || st.page < st.pages;
+
+    const drawControls = () => {
+      clearBtn.hidden = !input.value && !st.mode;
+      // 搜索结果的排序和时间（时间范围只对“最多观看”有效，选了时间会自动切到最多观看）
+      filters.replaceChildren();
+      if (st.mode === 'search') {
+        filters.append(
+          chipRow(ORDERS, st.order, (k) => { st.order = k; if (k !== 'mv') st.time = 'a'; run(st.q); }),
+          chipRow(TIMES, st.time, (k) => { st.time = k; if (k !== 'a') st.order = 'mv'; run(st.q); }));
+      }
+      filters.hidden = !filters.childElementCount;
+      // 没有在搜索时：排行榜和分类浏览
+      discover.replaceChildren();
+      if (st.mode !== 'search' && st.mode !== 'ids') {
+        const b = st.browse;
+        discover.append(
+          el('h3', {}, '排行榜'),
+          chipRow(RANKS, b && b.kind === 'rank' ? b.time : '', (k) =>
+            browse({ kind: 'rank', category: '0', order: 'mv', time: k, label: labelOf(RANKS, k) })),
+          el('h3', {}, '分类浏览'),
+          chipRow(CATEGORIES, b && b.kind === 'cat' ? b.category : '', (k) =>
+            browse({ kind: 'cat', category: k, order: b && b.kind === 'cat' ? b.order : 'mr', time: 'a', label: labelOf(CATEGORIES, k) })));
+        if (b && b.kind === 'cat') {
+          discover.append(chipRow(ORDERS, b.order, (k) => browse(Object.assign({}, b, { order: k }))));
+        }
+      }
+      discover.hidden = !discover.childElementCount;
+    };
+
+    const drawInfo = () => {
+      let text = '';
+      if (st.mode === 'ids') text = `识别到 ${st.items.length} 个 JM 号`;
+      else if (st.mode === 'search') {
+        const by = st.by === 'site' ? '' : labelOf(SEARCH_BY, st.by);
+        text = st.total ? `${by}“${st.q}”共 ${st.total} 条` : `${by}“${st.q}”没有找到结果`;
+      } else if (st.mode === 'browse') {
+        const b = st.browse;
+        const name = b.kind === 'rank' ? b.label : `${b.label} · ${labelOf(ORDERS, b.order)}`;
+        text = st.total ? `${name}，共 ${st.total} 本` : `${name}暂时没有数据`;
+      }
+      info.textContent = text;
+      info.hidden = !text;
+
+      bulk.replaceChildren();
+      if (st.mode === 'ids' && st.items.length > 1) {
+        const todo = st.items.filter((i) => i.state === 'none' || i.state === 'partial').map((i) => i.jmId);
+        if (todo.length) bulk.append(el('button', { class: 'chip', onclick: () => bulkAction('archive', todo) }, `全部入库（${todo.length} 本）`));
+        bulk.append(el('button', { class: 'chip', onclick: () => bulkAction('favorite', st.items.map((i) => i.jmId)) }, '全部收藏'));
+      }
+      bulk.hidden = !bulk.childElementCount;
+
+      // 隐藏的元素不会触发 IntersectionObserver，所以有结果时底部一直留着，只换文字
+      end.hidden = !(st.mode && st.items.length);
+      end.textContent = hasMore() ? '' : '没有更多了';
+    };
+    const drawAll = () => {
+      grid.replaceChildren(...st.items.slice(0, st.shown).map(searchCard));
+      drawControls();
+      drawInfo();
+    };
+
+    // 多个 JM 号时先列出号码，再逐个补上标题
+    const fillTitles = async () => {
+      for (const it of st.items.filter((i) => !i.title)) {
+        try {
+          const a = await api(`/api/jm/album/${it.jmId}`);
+          it.title = a.title;
+          it.author = a.authors.join('、');
+        } catch (e) {
+          it.title = '取不到详情';
+        }
+        const card = grid.querySelector(`[data-jm="${it.jmId}"]`);
+        if (card) card.replaceWith(searchCard(it));
+      }
+    };
+
+    const url = (page) => {
+      if (st.browse) {
+        const b = st.browse;
+        return `/api/jm/browse?category=${b.category}&order=${b.order}&time=${b.time}&page=${page}`;
+      }
+      return `/api/jm/search?q=${encodeURIComponent(st.q)}&by=${st.by}&order=${st.order}&time=${st.time}&page=${page}`;
+    };
+
+    // 换条件时旧结果先留着并变淡，新结果到了直接替换，不会闪回首页
+    const load = async () => {
+      loading = true;
+      st.pending = false;
+      grid.classList.add('busy');
+      drawControls();
+      info.textContent = '加载中…';
+      info.hidden = false;
+      try {
+        const d = await api(url(1));
+        Object.assign(st, { mode: d.mode, items: d.items, page: d.page, pages: d.pages, total: d.total, shown: STEP });
+        drawAll();
+        if (d.mode === 'ids') fillTitles();
+      } catch (e) {
+        info.textContent = e.message;
+        info.hidden = false;
+      }
+      grid.classList.remove('busy');
+      loading = false;
+      fillScreen();
+    };
+
+    const run = (q) => {
+      q = q.trim();
+      if (!q || loading) return;
+      input.blur();
+      st.q = q;
+      st.browse = null;
+      load();
+    };
+
+    const browse = (b) => {
+      if (loading) return;
+      input.value = '';
+      st.q = '';
+      st.browse = b;
+      load();
+    };
+
+    const reset = () => {
+      input.value = '';
+      Object.assign(st, newSearch('', st.by));
+      drawAll();
+      input.focus();
+    };
+
+    // 滑到接近底部时自动接上：每次多显示 20 本，当前一页看完了就取下一页（接口每页 80 条）
+    const showMore = async () => {
+      if (loading || !st.mode || !hasMore()) return;
+      loading = true;
+      end.textContent = '加载中…';
+      try {
+        if (st.shown + STEP > st.items.length && st.page < st.pages) {
+          const d = await api(url(st.page + 1));
+          const seen = new Set(st.items.map((i) => i.jmId));
+          st.items.push(...d.items.filter((i) => !seen.has(i.jmId)));
+          st.page = d.page;
+        }
+        const before = st.shown;
+        st.shown = Math.min(st.shown + STEP, st.items.length);
+        grid.append(...st.items.slice(before, st.shown).map(searchCard));
+      } catch (e) {
+        toast(e.message);
+      }
+      loading = false;
+      drawInfo();
+      fillScreen();
+    };
+    // 底部已经在视野附近时观察器不会再触发（状态没变），内容不够撑满屏幕就继续加载；
+    // 已经离开这个页面（底部不在文档里）就停，免得在后台一页页取下去
+    const fillScreen = () => {
+      if (hasMore() && end.isConnected && !end.hidden && end.getBoundingClientRect().top < innerHeight + 800) showMore();
+    };
+
+    const bulkAction = async (kind, jmIds) => {
+      try {
+        const r = await api(`/api/jm/${kind}`, { jmIds });
+        if (kind === 'archive') toast(r.queued ? `已加入入库队列 ${r.queued} 本，进度见“任务”` : '都已经入库或正在入库');
+        else toast('已全部收藏，入库和 PDF 进度见“任务”');
+        const d = await api(url(1));
+        const byId = new Map(d.items.map((i) => [i.jmId, i]));
+        st.items.forEach((it) => Object.assign(it, byId.get(it.jmId) || {}, { title: it.title, author: it.author }));
+        drawAll();
+      } catch (e) {
+        toast(e.message);
+      }
+    };
+
+    select.addEventListener('change', () => { st.by = select.value; if (input.value.trim()) run(input.value); });
+    input.addEventListener('input', () => { clearBtn.hidden = !input.value && !st.mode; });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run(input.value); }
+    });
+    app.replaceChildren(tabsBar('search'),
+      el('div', { class: 'searchbar' }, select, el('div', { class: 'input-wrap' }, input, clearBtn),
+        el('button', { class: 'primary small', onclick: () => run(input.value) }, '搜索')),
+      filters, discover, info, bulk, grid, end);
+    drawAll();
+    if (st.pending) run(st.q);
+    else if (st.items.length) S.scrollTo = st.scroll;
+    const io = new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) showMore(); },
+      { rootMargin: '800px 0px' });
+    io.observe(end);
+    S.cleanup = () => { st.scroll = window.scrollY; io.disconnect(); };
+  }
+
+  // ---- 搜索页新版（预览）：页面上始终是一个结果列表 ----
+  // 有输入时是搜索结果，没输入时是分类浏览；排行榜 = 分类浏览 + “今日 / 本周 / 本月 / 历史最热”排序
+  const SORTS = [['mr', '最新'], ['mv_t', '今日最热'], ['mv_w', '本周最热'], ['mv_m', '本月最热'],
+    ['mv', '历史最热'], ['mp', '图片最多'], ['tf', '点赞最多']];
+  const CHUNK = 20;
+  const sortParams = (v) => (v.startsWith('mv_') ? `order=mv&time=${v.slice(3)}` : `order=${v}&time=a`);
+
+  async function renderSearchV2() {
+    S.tab = 'search';
+    if (!S.search2) {
+      S.search2 = { q: '', by: 'site', sortQ: 'mr', sortB: 'mv_w', cat: '0',
+        mode: '', items: [], page: 0, pages: 0, total: 0, shown: CHUNK, scroll: 0, loaded: false };
+    }
+    const st = S.search2;
+    let fresh = !st.loaded;
+    if (S.pendingSearch) {
+      Object.assign(st, { q: S.pendingSearch.q, by: S.pendingSearch.by });
+      S.pendingSearch = null;
+      fresh = true;
+    }
+    let loading = false;
+
+    const pick = (list, value, onChange, cls) => {
+      const sel = el('select', { class: cls }, list.map(([k, label]) => el('option', { value: k, selected: k === value }, label)));
+      sel.addEventListener('change', () => onChange(sel.value));
+      return sel;
+    };
+    const bySel = pick(SEARCH_BY, st.by, (v) => { st.by = v; if (input.value.trim()) run(input.value); }, 'by-select');
+    const input = el('textarea', { class: 'input search-input', rows: 1, value: st.q });
+    const clearBtn = el('button', { class: 'clear-btn', 'aria-label': '清空', onclick: () => { input.value = ''; run(''); } }, '×');
+    const controls = el('div', { class: 'pills' });
+    const info = el('p', { class: 'muted small search-info' });
+    const bulk = el('div', { class: 'chips bulk' });
+    const grid = el('div', { class: 'grid' });
+    const end = el('p', { class: 'notice small' });
+    const hasMore = () => st.shown < st.items.length || st.page < st.pages;
+
+    const drawControls = () => {
+      clearBtn.hidden = !input.value && !st.q;
+      controls.replaceChildren();
+      if (!st.q) {
+        controls.append(pick(CATEGORIES.map(([k, label]) => [k, k === '0' ? '全部分类' : label]), st.cat,
+          (v) => { st.cat = v; reload(); }, 'pill-select'));
+      }
+      if (st.mode !== 'ids') {
+        controls.append(st.q
+          ? pick(SORTS, st.sortQ, (v) => { st.sortQ = v; reload(); }, 'pill-select')
+          : pick(SORTS, st.sortB, (v) => { st.sortB = v; reload(); }, 'pill-select'));
+      }
+      controls.hidden = !controls.childElementCount;
+    };
+
+    const drawInfo = () => {
+      let text;
+      if (st.mode === 'ids') text = `识别到 ${st.items.length} 个 JM 号`;
+      else if (st.q) {
+        const by = st.by === 'site' ? '' : `${labelOf(SEARCH_BY, st.by)} `;
+        text = st.total ? `${by}“${st.q}”共 ${st.total} 条` : `${by}“${st.q}”没有找到结果`;
+      } else {
+        text = st.total ? `共 ${st.total} 本` : '暂时没有数据';
+      }
+      info.textContent = st.loaded ? text : '';
+      info.hidden = !info.textContent;
+
+      bulk.replaceChildren();
+      if (st.mode === 'ids' && st.items.length > 1) {
+        const todo = st.items.filter((i) => i.state === 'none' || i.state === 'partial').map((i) => i.jmId);
+        if (todo.length) bulk.append(el('button', { class: 'chip', onclick: () => bulkAction('archive', todo) }, `全部入库（${todo.length} 本）`));
+        bulk.append(el('button', { class: 'chip', onclick: () => bulkAction('favorite', st.items.map((i) => i.jmId)) }, '全部收藏'));
+      }
+      bulk.hidden = !bulk.childElementCount;
+      end.hidden = !st.items.length;
+      end.textContent = hasMore() ? '' : '没有更多了';
+    };
+    const drawAll = () => {
+      grid.replaceChildren(...st.items.slice(0, st.shown).map(searchCard));
+      drawControls();
+      drawInfo();
+    };
+
+    const url = (page) => (st.q
+      ? `/api/jm/search?q=${encodeURIComponent(st.q)}&by=${st.by}&${sortParams(st.sortQ)}&page=${page}`
+      : `/api/jm/browse?category=${st.cat}&${sortParams(st.sortB)}&page=${page}`);
+
+    const fillTitles = async () => {
+      for (const it of st.items.filter((i) => !i.title)) {
+        try {
+          const a = await api(`/api/jm/album/${it.jmId}`);
+          it.title = a.title;
+          it.author = a.authors.join('、');
+        } catch (e) {
+          it.title = '取不到详情';
+        }
+        const card = grid.querySelector(`[data-jm="${it.jmId}"]`);
+        if (card) card.replaceWith(searchCard(it));
+      }
+    };
+
+    // 换条件时旧结果先变淡，新结果到了再替换
+    const reload = async () => {
+      if (loading) return;
+      loading = true;
+      grid.classList.add('busy');
+      drawControls();
+      info.textContent = '加载中…';
+      info.hidden = false;
+      try {
+        const d = await api(url(1));
+        Object.assign(st, { mode: d.mode, items: d.items, page: d.page, pages: d.pages, total: d.total,
+          shown: CHUNK, loaded: true });
+        drawAll();
+        window.scrollTo(0, 0);
+        if (d.mode === 'ids') fillTitles();
+      } catch (e) {
+        info.textContent = e.message;
+        info.hidden = false;
+      }
+      grid.classList.remove('busy');
+      loading = false;
+    };
+
+    const run = (q) => {
+      st.q = q.trim();
+      input.blur();
+      reload();
+    };
+
+    // 滑到接近底部时自动接上：先显示已取到的，不够了再取下一页（接口每页 80 条）
+    const showMore = async () => {
+      if (loading || !hasMore()) return;
+      loading = true;
+      end.textContent = '加载中…';
+      try {
+        if (st.shown + CHUNK > st.items.length && st.page < st.pages) {
+          const d = await api(url(st.page + 1));
+          const seen = new Set(st.items.map((i) => i.jmId));
+          st.items.push(...d.items.filter((i) => !seen.has(i.jmId)));
+          st.page = d.page;
+        }
+        const before = st.shown;
+        st.shown = Math.min(st.shown + CHUNK, st.items.length);
+        grid.append(...st.items.slice(before, st.shown).map(searchCard));
+      } catch (e) {
+        toast(e.message);
+      }
+      loading = false;
+      drawInfo();
+      // 内容还不够撑满屏幕时继续加载；已经离开这个页面就停
+      if (hasMore() && end.isConnected && end.getBoundingClientRect().top < innerHeight + 800) showMore();
+    };
+
+    const bulkAction = async (kind, jmIds) => {
+      try {
+        const r = await api(`/api/jm/${kind}`, { jmIds });
+        if (kind === 'archive') toast(r.queued ? `已加入入库队列 ${r.queued} 本，进度见“任务”` : '都已经入库或正在入库');
+        else toast('已全部收藏，入库和 PDF 进度见“任务”');
+        const d = await api(url(1));
+        const byId = new Map(d.items.map((i) => [i.jmId, i]));
+        st.items.forEach((it) => Object.assign(it, byId.get(it.jmId) || {}, { title: it.title, author: it.author }));
+        drawAll();
+      } catch (e) {
+        toast(e.message);
+      }
+    };
+
+    input.addEventListener('input', () => { clearBtn.hidden = !input.value && !st.q; });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); run(input.value); }
+    });
+    app.replaceChildren(tabsBar('search'),
+      el('div', { class: 'searchbar' }, bySel, el('div', { class: 'input-wrap' }, input, clearBtn),
+        el('button', { class: 'primary small', onclick: () => run(input.value) }, '搜索')),
+      controls, info, bulk, grid, end);
+    drawAll();
+    if (fresh) reload();
+    else S.scrollTo = st.scroll;
+    const io = new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) showMore(); },
+      { rootMargin: '800px 0px' });
+    io.observe(end);
+    S.cleanup = () => { st.scroll = window.scrollY; io.disconnect(); };
+  }
+
+  // ---- JM 作品详情（搜索结果点进来） ----
+  async function renderJm(jm) {
+    S.parent = S.tab === 'jobs' ? '#/jobs' : S.tab === 'library' ? '#/' : '#/search';
+    let a = await api(`/api/jm/album/${jm}`);
+    const multi = a.chapters.length > 1;
+    const actions = el('div', { class: 'actions' });
+    const statusLine = el('p', { class: 'muted small' });
+    let prog = null;   // 入库进度条：每次轮询只改宽度和文字，不重建
+    let timer = null;
+
+    const act = (label, cls, fn) => el('button', {
+      class: cls,
+      onclick: async (e) => {
+        e.currentTarget.disabled = true;
+        try { await fn(); } catch (err) { toast(err.message); }
+        await refresh();
+      },
+    }, label);
+
+    const progressBox = () => {
+      const bar = el('span', { class: 'bar' });
+      const label = el('span', { class: 'label' });
+      const btn = el('button', { class: 'progress-btn', disabled: true }, bar, label);
+      const text = el('p', { class: 'muted small progress-text' });
+      return { box: el('div', { class: 'progress-box' }, btn, text), btn, label, text };
+    };
+    const updateProgress = (pg) => {
+      const percent = pg ? pg.percent : 0;
+      prog.btn.classList.toggle('queued', !!(pg && pg.queued));
+      prog.btn.style.setProperty('--p', `${percent}%`);
+      prog.label.textContent = pg && pg.queued ? '排队中' : `入库中 ${percent}%`;
+      prog.text.textContent = pg ? pg.text : '准备中';
+    };
+
+    const drawStatus = () => {
+      const stateText = { archived: '已入库', archiving: '入库中', partial: `部分入库（${a.archivedChapters}/${a.chapters.length} 章）` }[a.state] || '未入库';
+      const pdfText = { done: '已生成', running: '生成中' }[a.pdf] || (a.fav ? '等入库完成后生成' : '收藏后自动生成');
+      statusLine.textContent = `状态：${stateText}　收藏：${a.fav ? a.folders.join('、') : '未收藏'}　PDF：${pdfText}`;
+    };
+
+    const drawActions = () => {
+      prog = null;
+      const items = [];
+      if (a.archivedChapters > 0 && a.state !== 'archiving') {
+        items.push(el('button', { class: 'primary', onclick: async () => go(await continueTarget(jm)) }, '开始阅读'));
+      }
+      if (a.state === 'archiving') {
+        prog = progressBox();
+        updateProgress(a.progress);
+        items.push(prog.box);
+      } else if (a.state !== 'archived') {
+        const label = a.state === 'partial' ? `补齐入库（已入库 ${a.archivedChapters}/${a.chapters.length} 章）` : '入库';
+        items.push(act(label, a.archivedChapters ? 'secondary' : 'primary', async () => {
+          const r = await api('/api/jm/archive', { jmIds: [jm] });
+          if (!r.queued) toast('已经入库了');
+        }));
+      }
+      if (!a.fav) {
+        items.push(act('收藏', 'secondary', async () => {
+          const r = await api('/api/jm/favorite', { jmIds: [jm] });
+          toast(NEXT_TEXT[r.next] || '已收藏');
+        }));
+      } else if (a.inLibrary) {
+        items.push(el('button', { class: 'secondary', onclick: () => go(`#/a/${jm}`) }, '在书架中打开，管理收藏夹'));
+      }
+      actions.replaceChildren(...items);
+      drawStatus();
+    };
+
+    // 重新取状态：入库中只更新进度条；状态变了才重画按钮（入库完成时按钮就地变成“开始阅读”）
+    const refresh = async () => {
+      let b;
+      try { b = await api(`/api/jm/album/${jm}`); } catch (e) { return; }
+      const changed = b.state !== a.state || b.fav !== a.fav || b.pdf !== a.pdf || b.archivedChapters !== a.archivedChapters;
+      const finished = a.state === 'archiving' && b.state !== 'archiving';
+      a = b;
+      if (changed || !prog) drawActions();
+      else updateProgress(a.progress);
+      if (finished) toast(a.state === 'archived' ? '入库完成' : '入库没有完成，可以到“任务”里看原因');
+      const busy = a.state === 'archiving' || a.pdf === 'running';
+      if (busy && !timer) timer = setInterval(refresh, 1500);
+      if (!busy && timer) { clearInterval(timer); timer = null; }
+    };
+
+    drawActions();
+    app.replaceChildren(el('div', { class: 'album' },
+      el('div', { class: 'album-head' },
+        el('div', { class: 'cover' }, el('img', { src: jmCoverUrl(jm), alt: '' })),
+        el('div', {},
+          el('h2', {}, a.title),
+          el('p', { class: 'muted' }, `JM${jm}`),
+          a.authors.length ? searchLinks(a.authors, 'author') : null,
+          a.works.length ? searchLinks(a.works, 'work') : null,
+          el('p', { class: 'muted' }, `${a.chapters.length} 章 · ${a.pageCount || '-'} 页`))),
+      a.tags.length ? searchLinks(a.tags, 'tag', 'muted small') : null,
+      actions,
+      statusLine,
+      multi ? el('h3', {}, `章节（${a.chapters.length}）`) : null,
+      multi ? el('ol', { class: 'chapters' }, a.chapters.slice(0, 200).map((c) =>
+        el('li', {}, el('div', { class: 'chapter-row' },
+          el('span', { class: 'name' }, `第 ${c.sort} 章  ${c.title}`))))) : null));
+
+    if (a.state === 'archiving' || a.pdf === 'running') timer = setInterval(refresh, 1500);
+    S.cleanup = () => { if (timer) clearInterval(timer); };
+  }
+
+  // ---- 任务 ----
+  const STATUS_TEXT = { queued: '排队中', running: '进行中', done: '完成', failed: '失败' };
+  const KIND_TEXT = { archive: '入库', favorite: '收藏 PDF' };
+
+  async function renderJobs() {
+    S.tab = 'jobs';
+    const head = el('p', { class: 'muted small jobs-head' });
+    const list = el('ol', { class: 'chapters jobs' });
+    app.replaceChildren(tabsBar('jobs'), head, list);
+    const draw = (d) => {
+      head.textContent = d.running || d.queued ? `进行中 ${d.running} 个，排队 ${d.queued} 个，每 3 秒自动刷新` : '当前没有进行中的任务';
+      if (!d.items.length) {
+        list.replaceChildren(el('li', {}, el('p', { class: 'notice' }, '还没有任务。')));
+        return;
+      }
+      list.replaceChildren(...d.items.map((j) => {
+        const status = j.status === 'queued' && j.retryAt ? '等待重试' : (STATUS_TEXT[j.status] || j.status);
+        const time = new Date(j.updatedAt * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+        const detail = j.status === 'failed' ? j.error : j.status === 'done' ? '' : j.step;
+        return el('li', {}, el('a', { class: 'job', href: `#/jm/${j.jmId}` },
+          el('div', { class: 'grow' },
+            el('div', { class: 'name' }, `${KIND_TEXT[j.kind] || j.kind} · JM${j.jmId}`),
+            j.title ? el('div', { class: 'muted small clip' }, j.title) : null,
+            detail ? el('div', { class: j.status === 'failed' ? 'small err' : 'small muted' }, detail) : null,
+            j.percent != null ? el('div', { class: 'mini-bar', style: `--p: ${j.percent}%` }) : null),
+          el('div', { class: 'job-side' }, el('span', { class: `pill ${j.status}` }, status), el('span', { class: 'muted small' }, time))));
+      }));
+    };
+    draw(await api('/api/jobs'));
+    const timer = setInterval(async () => {
+      try { draw(await api('/api/jobs')); } catch (e) { /* 下次再试 */ }
+    }, 3000);
+    S.cleanup = () => clearInterval(timer);
   }
 
   // ---- 阅读 ----
@@ -429,6 +1028,7 @@
           if (pg) setCurrent(Number(pg.dataset.n));
         });
       };
+      S.scrollTo = null;
       if (current > 1) list.children[current - 1].scrollIntoView({ block: 'start' });
       window.addEventListener('scroll', onScroll, { passive: true });
       teardown = () => { io.disconnect(); window.removeEventListener('scroll', onScroll); };
@@ -505,6 +1105,12 @@
     try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) { /* 旧版客户端 */ }
     if (tg.BackButton) tg.BackButton.onClick(() => go(S.parent || '#/'));
 
+    try {
+      const ui = new URLSearchParams(location.search).get('ui');
+      if (ui) sessionStorage.setItem('jm.ui', ui);
+      S.ui2 = (ui || sessionStorage.getItem('jm.ui')) === '2';
+    } catch (e) { /* 存储不可用时只看网址参数 */ }
+
     let d;
     try {
       d = await login();
@@ -519,9 +1125,12 @@
       const chapter = /^c(\d+)$/.exec(sp);
       const album = /^a(\d+)$/.exec(sp);
       const jm = (album && album[1]) || params.get('read') || params.get('a') || '';
+      const by = SEARCH_BY.some(([k]) => k === params.get('by')) ? params.get('by') : 'site';
       let target = '#/';
       if (chapter) target = `#/r/${chapter[1]}`;
       else if (/^\d+$/.test(jm)) target = await continueTarget(Number(jm));
+      else if (params.get('search')) { S.pendingSearch = { q: params.get('search'), by }; target = '#/search'; }
+      else if (['search', 'jobs'].includes(params.get('tab'))) target = `#/${params.get('tab')}`;
       history.replaceState(null, '', location.pathname + location.search + target);
     }
     window.addEventListener('hashchange', render);

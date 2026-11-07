@@ -68,6 +68,9 @@ def album_view(cfg, db, storage, album: dict, user_id: int) -> tuple[str, list]:
             first.append(read)
     first.append(Button.inline("取消收藏", f"uf:{jm_id}") if folders else Button.inline("收藏", f"fv:{jm_id}"))
     rows.append(first)
+    authors = [Button.inline(f"作者：{clip(name, 16)}", f"au:{jm_id}:{i}") for i, name in enumerate(album["authors"][:2])]
+    if authors:
+        rows.append(authors)
     links = []
     if archived:
         top = min(archived.values(), key=lambda r: r["sort"])
