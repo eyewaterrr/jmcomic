@@ -1023,7 +1023,7 @@
       root.append(top, list, end, bottom);
       app.replaceChildren(root);
 
-      // 画好的页只保留屏幕附近的（上下各约 6 屏），离远了就释放 Canvas，长篇也不会占满手机内存
+      // 画好的页只保留屏幕附近的（上下各约 3 屏），离远了就释放 Canvas，长篇也不会占满手机内存
       const shown = new Map();
       const wanted = new Set();
       const load = async (div) => {
@@ -1060,7 +1060,7 @@
         if (e.isIntersecting) return;
         wanted.delete(Number(e.target.dataset.n));
         unload(e.target);
-      }), { rootMargin: '600% 0px' });
+      }), { rootMargin: '300% 0px' });
       list.querySelectorAll('.pg').forEach((p) => { near.observe(p); far.observe(p); });
 
       root.addEventListener('click', (e) => {
