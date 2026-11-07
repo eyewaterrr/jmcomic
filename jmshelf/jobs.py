@@ -1,28 +1,26 @@
-"""任务队列（串行执行）：
+"""任务队列和后台工作（v3）：
 
-- archive：取详情 → 子进程下载每章 → 打包 CBZ → 并行上传书库频道 → 写索引
-- favorite：从书库频道取回各章 → 子进程转 PDF → 上传精选频道（被收藏的作品自动生成）
-- 每 24 小时把数据库快照发到书库频道，只保留最近 3 份
-- 开启后每 24 小时同步一次 JM 账号收藏夹
+- publish（上传精选）：取作品全部章节 → 从缓存取原图，缺的从 JM 补下 → 子进程还原并合成 PDF
+  → 并行上传精选频道。这是唯一的任务类型，串行执行。
+- 收藏只改收藏夹，不建任务；新收藏、读过的作品在后台补元数据和封面（书架显示用）。
+- 开启后每 24 小时同步一次 JM 账号收藏夹（只镜像收藏夹）。
 
-批量任务（多个 JM 号、JM 收藏夹同步）共用一条进度消息，不逐本发消息。
+数据库备份不在这里做：服务器的每周 R2 备份已经包含数据库快照和配置。
 """
 import asyncio
-import gzip
 import json
 import logging
 import os
 import shutil
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
 from telethon import Button
-from telethon.errors import MessageNotModifiedError
+from telethon.errors import MessageDeleteForbiddenError, MessageNotModifiedError
 
-from . import meta, pack, sync, ui
+from . import images, meta, sync, ui
 from .fmt import clip, esc, size_text
 
 log = logging.getLogger(__name__)
@@ -30,8 +28,6 @@ log = logging.getLogger(__name__)
 MAX_ATTEMPTS = 3
 MIN_FREE_BYTES = 1536 * 1024 * 1024
 STATUS_INTERVAL = 3
-BACKUP_INTERVAL = 24 * 3600
-BACKUP_KEEP = 3
 SYNC_INTERVAL = 24 * 3600
 UPDATE_REQUEST_INTERVAL = 6 * 3600
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -41,69 +37,87 @@ class JobError(Exception):
     """不需要重试的错误，原样告诉用户。"""
 
 
-class Deferred(Exception):
-    """前置任务还没完成，稍后再跑，不算失败次数。"""
-
-
 def _file_name(text: str) -> str:
     return "".join("_" if ch in '/\\:*?"<>|\n\r\t' else ch for ch in text).strip()
 
 
 class Worker:
-    def __init__(self, cfg, db, jm, storage, client, bot_username: str):
+    def __init__(self, cfg, db, jm, storage, client, bot_username: str, cache=None):
         self.cfg = cfg
         self.db = db
         self.jm = jm
         self.storage = storage
         self.client = client
         self.bot_username = bot_username
+        self.cache = cache
         self._wake = asyncio.Event()
         self._last_status: dict[int, float] = {}
-        self._last_batch: dict[int, float] = {}
+        self._push_lock = asyncio.Lock()
+        self._meta_queue: asyncio.Queue | None = None
+        self._meta_pending: set[int] = set()
+        self.live: dict[int, dict] = {}  # 任务 ID → {"percent", "text"}，作品页的进度条用
 
-    # ---- 提交 ----
-    async def submit(self, kind: str, jm_id: int, user_id: int, batch_id: int | None = None) -> tuple[str, int]:
-        """建任务。单个任务在私聊里发一条进度消息；批量任务用批次的进度消息。
-        返回 (状态, 任务 ID)，状态为 created / exists。"""
+    # ---- 上传精选 ----
+    async def submit(self, kind: str, jm_id: int, user_id: int) -> tuple[str, int]:
+        """建任务并在私聊里发一条进度消息。返回 (状态, 任务 ID)，状态为 created / exists。"""
         active = self.db.active_job(kind, jm_id)
         if active:
             return "exists", active["id"]
-        msg_id = None
-        if batch_id is None:
-            msg = await self.client.send_message(user_id, f"JM{jm_id} {ui.KIND_NAME[kind]}：已加入队列")
-            msg_id = msg.id
-        job_id, _ = self.db.add_job(kind, jm_id, user_id, user_id if batch_id is None else None, msg_id, batch_id)
+        msg = await self.client.send_message(user_id, f"JM{jm_id} {ui.KIND_NAME[kind]}：已加入队列")
+        job_id, _ = self.db.add_job(kind, jm_id, user_id, user_id, msg.id)
         self._wake.set()
         return "created", job_id
 
-    async def favorite(self, user_id: int, jm_id: int, batch_id: int | None = None) -> str:
-        """加入默认收藏夹，并安排后续工作：没入库就先入库，入库完成后自动生成 PDF。"""
+    async def publish(self, user_id: int, jm_id: int) -> str:
+        """返回 done（已经上传过）/ created / exists。"""
+        if self.db.pick(jm_id):
+            return "done"
+        status, _ = await self.submit("publish", jm_id, user_id)
+        return status
+
+    # ---- 收藏（只改收藏夹） ----
+    async def favorite(self, user_id: int, jm_id: int):
+        was = self.db.is_favorited(user_id, jm_id)
         self.db.add_to_folder(self.db.default_folder(user_id), jm_id)
+        self.remember(jm_id)
         self.save_meta(jm_id)
-        return await self.after_favorite(user_id, jm_id, batch_id)
+        if not was:
+            self.queue_jm_push(user_id, [jm_id])
 
-    async def after_favorite(self, user_id: int, jm_id: int, batch_id: int | None = None) -> str:
-        if not self.db.fully_archived(jm_id):
-            await self.submit("archive", jm_id, user_id, batch_id)
-            return "archive"
-        if not self.db.pdf_record(jm_id):
-            await self.submit("favorite", jm_id, user_id, batch_id)
-            return "pdf"
-        return "done"
+    async def favorite_many(self, user_id: int, jm_ids: list[int]):
+        jm_ids = list(dict.fromkeys(jm_ids))
+        self.queue_jm_push(user_id, [j for j in jm_ids if not self.db.is_favorited(user_id, j)])
+        folder = self.db.default_folder(user_id)
+        for jm_id in jm_ids:
+            self.db.add_to_folder(folder, jm_id)
+            self.remember(jm_id)
+            self.save_meta(jm_id)
 
-    async def start_batch(self, user_id: int, label: str, archive_ids: list[int], pdf_ids: list[int]) -> int | None:
-        """建一个批次：archive_ids 入库（被收藏的入库后自动生成 PDF），pdf_ids 直接生成 PDF。"""
-        archive_ids = [i for i in archive_ids if not self.db.active_job("archive", i)]
-        pdf_ids = [i for i in pdf_ids if not self.db.active_job("favorite", i)]
-        if not archive_ids and not pdf_ids:
-            return None
-        msg = await self.client.send_message(user_id, f"{label}：已加入队列，入库 {len(archive_ids)} 本，生成 PDF {len(pdf_ids)} 本")
-        batch_id = self.db.create_batch(user_id, label, user_id, msg.id)
-        for jm_id in archive_ids:
-            await self.submit("archive", jm_id, user_id, batch_id)
-        for jm_id in pdf_ids:
-            await self.submit("favorite", jm_id, user_id, batch_id)
-        return batch_id
+    def queue_jm_push(self, user_id: int, jm_ids: list[int]):
+        """反向同步：所有者在这边收藏时，也加进 JM 账号的收藏。开关在 /jmsync，默认关闭；只加不删。"""
+        if (user_id != self.cfg.owner_id or not jm_ids or not self.cfg.jm_username
+                or self.db.get_meta("jm_reverse") != "1"):
+            return
+        asyncio.get_running_loop().create_task(self._push_jm(list(jm_ids)))
+
+    async def _push_jm(self, jm_ids: list[int]):
+        async with self._push_lock:
+            try:
+                result = await self.jm.push_favorites(self.cfg.jm_username, self.cfg.jm_password, jm_ids)
+            except Exception as e:
+                result = {"added": [], "skipped": [], "failed": [(i, clip(str(e) or type(e).__name__, 120)) for i in jm_ids]}
+            self.db.set_meta("jm_reverse_last", json.dumps({
+                "at": int(time.time()), "added": len(result["added"]),
+                "skipped": len(result["skipped"]), "failed": len(result["failed"])}))
+            log.info("反向同步到 JM：加入 %s，已在 JM 收藏 %s，失败 %s",
+                     result["added"], result["skipped"], result["failed"])
+            if result["failed"]:
+                lines = [f"JM{i}：{esc(err)}" for i, err in result["failed"][:10]]
+                try:
+                    await self.client.send_message(self.cfg.owner_id, "反向同步到 JM 失败：\n" + "\n".join(lines),
+                                                   parse_mode="html")
+                except Exception:
+                    log.warning("发送反向同步失败通知失败", exc_info=True)
 
     def save_meta(self, jm_id: int):
         try:
@@ -111,12 +125,52 @@ class Worker:
         except Exception:
             log.warning("写 JM%s 元数据文件失败", jm_id, exc_info=True)
 
+    # ---- 作品元数据（书架显示用） ----
+    def remember(self, jm_id: int, album: dict | None = None):
+        """记下这本作品：已有详情就直接写进数据库，否则先占位，由后台慢慢补（一次一本，不扎堆请求 JM）。"""
+        if album is not None:
+            self.db.upsert_album(album)
+            self.save_meta(jm_id)
+            if not (self.cfg.cover_dir / f"{jm_id}.jpg").exists():
+                self._queue_meta(jm_id)
+            return
+        self.db.ensure_album_stub(jm_id)
+        row = self.db.album(jm_id)
+        if not row["title"] or not (self.cfg.cover_dir / f"{jm_id}.jpg").exists():
+            self._queue_meta(jm_id)
+
+    def _queue_meta(self, jm_id: int):
+        if self._meta_queue is None:
+            self._meta_queue = asyncio.Queue()
+        if jm_id not in self._meta_pending:
+            self._meta_pending.add(jm_id)
+            self._meta_queue.put_nowait(jm_id)
+
+    async def _meta_loop(self):
+        for jm_id in self.db.stub_albums():
+            self._queue_meta(jm_id)
+        if self._meta_queue is None:
+            self._meta_queue = asyncio.Queue()
+        while True:
+            jm_id = await self._meta_queue.get()
+            try:
+                row = self.db.album(jm_id)
+                if row is None or not row["title"]:
+                    self.db.upsert_album(await self.jm.album(jm_id))
+                    self.save_meta(jm_id)
+                await self.ensure_cover(jm_id)
+            except Exception as e:
+                log.info("补 JM%s 的元数据失败：%s", jm_id, e)
+            finally:
+                self._meta_pending.discard(jm_id)
+            await asyncio.sleep(0.5)
+
     # ---- 主循环 ----
     async def run(self):
         self.db.requeue_running()
         for d in (self.cfg.work_dir, self.cfg.cover_dir, self.cfg.cache_dir):
             d.mkdir(parents=True, exist_ok=True)
-        side = [asyncio.create_task(self._backup_loop()), asyncio.create_task(self._sync_loop())]
+        side = [asyncio.create_task(self._sync_loop()), asyncio.create_task(self._meta_loop())]
         try:
             while True:
                 job = self.db.next_job()
@@ -128,8 +182,6 @@ class Worker:
                         pass
                     continue
                 await self._process(job)
-                if job["batch_id"]:
-                    await self._batch_status(job["batch_id"])
         finally:
             for t in side:
                 t.cancel()
@@ -144,18 +196,13 @@ class Worker:
             free = shutil.disk_usage(self.cfg.data_dir).free
             if free < MIN_FREE_BYTES:
                 raise JobError(f"服务器磁盘只剩 {size_text(free)}，暂停接新任务")
-            if job["kind"] == "archive":
-                await self._archive(job, workdir)
-            elif job["kind"] == "favorite":
-                await self._favorite(job, workdir)
+            if job["kind"] == "publish":
+                await self._publish(job, workdir)
             else:
                 raise JobError(f"未知任务类型 {job['kind']}")
             self.db.update_job(job["id"], status="done", step="")
         except asyncio.CancelledError:
             raise
-        except Deferred as e:
-            self.db.update_job(job["id"], status="queued", attempts=job["attempts"], step=str(e),
-                               run_after=int(time.time()) + 120)
         except Exception as e:
             log.exception("任务 %s 失败", job["id"])
             reason = clip(str(e) or type(e).__name__, 300)
@@ -167,6 +214,7 @@ class Worker:
                 self.db.update_job(job["id"], status="failed", error=reason)
                 await self._status(job, f"失败：{esc(reason)}", force=True)
         finally:
+            self.live.pop(job["id"], None)
             shutil.rmtree(workdir, ignore_errors=True)
 
     async def _status(self, job, text: str, force: bool = False, buttons=None):
@@ -178,7 +226,7 @@ class Worker:
         row = self.db.job(job["id"])
         if not row["chat_id"]:
             return
-        body = f"JM{row['jm_id']} {ui.KIND_NAME[row['kind']]}：{text}"
+        body = f"JM{row['jm_id']} {ui.KIND_NAME.get(row['kind'], row['kind'])}：{text}"
         await self._edit_or_send(row["chat_id"], row["msg_id"], body, buttons,
                                  lambda mid: self.db.update_job(job["id"], msg_id=mid))
 
@@ -196,37 +244,29 @@ class Worker:
         except Exception:
             log.warning("更新进度消息失败", exc_info=True)
 
-    async def _batch_status(self, batch_id: int):
-        batch = self.db.batch(batch_id)
-        if batch is None or batch["finished"]:
-            return
-        counts = self.db.batch_counts(batch_id)
-
-        def n(kind, *statuses):
-            return sum(counts.get((kind, s), 0) for s in statuses)
-
-        active = n("archive", "queued", "running") + n("favorite", "queued", "running")
-        now = time.monotonic()
-        if active and now - self._last_batch.get(batch_id, 0) < 5:
-            return
-        self._last_batch[batch_id] = now
-        a_total = sum(v for (k, _), v in counts.items() if k == "archive")
-        p_total = sum(v for (k, _), v in counts.items() if k == "favorite")
-        failed = n("archive", "failed") + n("favorite", "failed")
-        text = (f"{esc(batch['label'])}：入库 {n('archive', 'done')}/{a_total}，"
-                f"生成 PDF {n('favorite', 'done')}/{p_total}" + (f"，失败 {failed}" if failed else ""))
-        if not active:
-            self.db.finish_batch(batch_id)
-            text = "完成。" + text + ("。失败的任务可以发 /jobs 查看原因" if failed else "")
-        await self._edit_or_send(batch["chat_id"], batch["msg_id"], text, None,
-                                 lambda mid: self.db.set_batch_msg(batch_id, mid))
-
-    def _progress(self, job, label: str):
+    def _progress(self, job, label: str, span: tuple[float, float] | None = None):
+        """上传进度回调：更新私聊进度消息；给了 span（起点, 终点，0–1）时同时更新进度条。"""
         def callback(done, total):
+            frac = done / max(total, 1)
+            if span:
+                self._set_live(job, span[0] + (span[1] - span[0]) * frac, f"{label}上传 {frac * 100:.0f}%")
             if time.monotonic() - self._last_status.get(job["id"], 0) >= STATUS_INTERVAL:
                 asyncio.get_running_loop().create_task(
-                    self._status(job, f"{label}上传 {done * 100 // max(total, 1)}%（{size_text(total)}）"))
+                    self._status(job, f"{label}上传 {frac * 100:.0f}%（{size_text(total)}）"))
         return callback
+
+    def _set_live(self, job, fraction: float, text: str):
+        self.live[job["id"]] = {"percent": max(0, min(100, round(fraction * 100))), "text": text}
+
+    def progress_for(self, kind: str, jm_id: int) -> dict | None:
+        """某作品进行中的任务进度：正在跑的给百分比，排队中的给前面还有几个任务。"""
+        job = self.db.active_job(kind, jm_id)
+        if job is None:
+            return None
+        if job["status"] == "running":
+            return dict(self.live.get(job["id"], {"percent": 0, "text": "准备中"}), queued=False)
+        ahead = self.db.jobs_ahead(job["id"])
+        return {"percent": 0, "text": f"排队中，前面还有 {ahead} 个任务" if ahead else "排队中", "queued": True}
 
     async def _run_module(self, args: list[str], cwd: Path, timeout: int) -> str:
         env = dict(os.environ, PYTHONPATH=str(PACKAGE_ROOT))
@@ -235,17 +275,19 @@ class Worker:
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
             proc.kill()
             await proc.wait()
+            if isinstance(e, asyncio.CancelledError):
+                raise
             raise RuntimeError(f"{args[0]} 超时")
         if proc.returncode != 0:
             tail = err.decode(errors="replace").strip().splitlines()[-3:]
             raise RuntimeError(f"{args[0]} 出错：{' | '.join(tail)}")
         return out.decode().strip().splitlines()[-1]
 
-    def _request_update_check(self):
-        """下载出错可能是 JM 改了接口：请求自动更新服务检查一次 jmcomic 新版本（6 小时内最多一次）。"""
+    def request_update_check(self):
+        """从 JM 下载出错可能是 JM 改了接口：请求自动更新服务检查一次 jmcomic 新版本（6 小时内最多一次）。"""
         last = int(self.db.get_meta("update_request_at", "0"))
         if time.time() - last < UPDATE_REQUEST_INTERVAL:
             return
@@ -284,9 +326,8 @@ class Worker:
             im.thumbnail((320, 320))
             im.save(thumb, "JPEG", quality=80)
 
-    # ---- 入库 ----
     def _caption(self, title: str, jm_id: int, detail: str) -> str:
-        # 只放给人看的内容；JM 号、章节号等机器信息在 CBZ 的 ComicInfo.xml 和 PDF 元数据里
+        # 只放给人看的内容；JM 号、卷号等机器信息在 PDF 元数据里
         return f"<b>[JM{jm_id}] {esc(clip(title, 300))}</b>\n{esc(detail)}\n#JM{jm_id}"
 
     def _read_button(self, param: str):
@@ -294,142 +335,115 @@ class Worker:
             return None
         return [Button.url("在线阅读", ui.startapp_link(self.bot_username, param))]
 
-    async def _archive(self, job, workdir: Path):
+    async def _publish(self, job, workdir: Path):
         jm_id = job["jm_id"]
+        if self.db.pick(jm_id):
+            await self._status(job, "已经上传过了", force=True)
+            return
+        self._set_live(job, 0, "获取作品信息")
         await self._status(job, "获取作品信息", force=True)
-        album = await self.jm.album(jm_id)
-        self.db.upsert_album(album)
+        try:
+            album = await self.jm.album(jm_id, fresh=True)
+            details = [await self.jm.chapter(c["photo_id"]) for c in album["chapters"]]
+        except Exception:
+            self.request_update_check()
+            raise
+        self.remember(jm_id, album)
         thumb = await self.ensure_cover(jm_id)
         chapters = album["chapters"]
-        total = len(chapters)
-        for i, ch in enumerate(chapters, 1):
-            if self.db.chapter(ch["photo_id"]):
-                continue
-            label = f"第 {i}/{total} 章，" if total > 1 else ""
-            await self._status(job, f"{label}下载图片", force=True)
-            img_dir = workdir / str(ch["photo_id"])
-            try:
-                await self._run_module(
-                    ["jmshelf.fetch", str(ch["photo_id"]), str(img_dir), str(self.cfg.image_threads)],
-                    cwd=workdir, timeout=3600)
-            except RuntimeError:
-                self._request_update_check()
-                raise
-            images = pack.list_images(img_dir)
-            if not images:
-                raise RuntimeError("没有下载到图片")
+        total = sum(len(d["pages"]) for d in details)
+        if not total:
+            raise JobError("JM 上这本没有图片")
 
-            await self._status(job, f"{label}打包 {len(images)} 页", force=True)
-            cbz = workdir / f"{ch['photo_id']}.cbz"
-            info = pack.comicinfo_xml(album, ch, len(images))
-            pages, sha = await asyncio.to_thread(pack.build_cbz, images, cbz, info)
-            shutil.rmtree(img_dir, ignore_errors=True)
-            size = cbz.stat().st_size
+        pages: list[list] = []
+        with self.cache.lock(c["photo_id"] for c in chapters):
+            before = 0
+            for i, (ch, d) in enumerate(zip(chapters, details), 1):
+                self.db.set_chapter_pages(ch["photo_id"], len(d["pages"]))
+                label = f"第 {i}/{len(chapters)} 章，" if len(chapters) > 1 else ""
 
-            if total > 1:
-                detail = f"第 {i}/{total} 章 · {ch['title']} · {len(pages)} 页 · {size_text(size)}"
-                name = f"[JM{jm_id}] {clip(album['title'], 60)} - {ch['sort']:02d}.cbz"
-            else:
-                detail = f"{len(pages)} 页 · {size_text(size)}"
-                name = f"[JM{jm_id}] {clip(album['title'], 80)}.cbz"
-            msg = await self.storage.send_document(
-                self.storage.channel, cbz, self._caption(album["title"], jm_id, detail),
-                _file_name(name), thumb=thumb, buttons=self._read_button(f"c{ch['photo_id']}"),
-                progress=self._progress(job, label))
-            self.db.add_chapter(jm_id, ch["photo_id"], ch["sort"], ch["title"], msg.id, size, sha, pages)
-            self.save_meta(jm_id)
-            cbz.unlink(missing_ok=True)
+                def progress(done, count, base=before, label=label):
+                    text = f"{label}准备图片 {done}/{count} 页"
+                    self._set_live(job, 0.6 * (base + done) / total, text)
+                    if time.monotonic() - self._last_status.get(job["id"], 0) >= STATUS_INTERVAL:
+                        asyncio.get_running_loop().create_task(self._status(job, text))
 
-        # 先标记完成，按钮才不会显示“入库中”
-        self.db.update_job(job["id"], status="done")
-        self.save_meta(jm_id)
-        if self.db.favorited_by_anyone(jm_id) and not self.db.pdf_record(jm_id):
-            await self.submit("favorite", jm_id, job["user_id"], job["batch_id"])
-        _, buttons = ui.album_view(self.cfg, self.db, self.storage, album, job["user_id"])
-        pages = sum(r["page_count"] for r in self.db.chapters(jm_id))
-        await self._status(job, f"完成，{total} 章 {pages} 页", force=True, buttons=buttons)
+                try:
+                    paths = await self.cache.fill(ch["photo_id"], d, progress)
+                except Exception:
+                    self.request_update_check()
+                    raise
+                pages += [[str(p), info["num"]] for p, info in zip(paths, d["pages"])]
+                before += len(d["pages"])
 
-    # ---- 收藏 PDF ----
-    async def _favorite(self, job, workdir: Path):
-        jm_id = job["jm_id"]
-        if self.db.active_job("archive", jm_id):
-            raise Deferred("等待入库完成")
-        album = self.db.album(jm_id)
-        chapters = self.db.chapters(jm_id)
-        if not album or len(chapters) < album["chapter_count"]:
-            raise JobError("这本还没有完整入库，请先入库")
-        if self.db.pdf_record(jm_id):
-            await self._status(job, "PDF 已经生成过了", force=True)
-            return
+            self._set_live(job, 0.62, f"生成 PDF（{total} 页）")
+            await self._status(job, f"生成 PDF（{total} 页）", force=True)
+            authors = album["authors"]
+            spec = {
+                "jm_id": jm_id,
+                "out_dir": str(workdir / "pdf"),
+                "name": _file_name(f"[JM{jm_id}] {clip(album['title'], 80)}"),
+                "title": album["title"], "author": ", ".join(authors),
+                "quality": self.cfg.pdf_quality, "volume_bytes": self.cfg.pdf_volume_mb * 1024 * 1024,
+                "pages": pages,
+            }
+            spec_path = workdir / "pdf.json"
+            spec_path.write_text(json.dumps(spec, ensure_ascii=False))
+            result = json.loads(await self._run_module(["jmshelf.pdf", str(spec_path)], cwd=workdir, timeout=3600))
 
-        cbz_files = []
-        for i, ch in enumerate(chapters, 1):
-            await self._status(job, f"取回第 {i}/{len(chapters)} 章", force=True)
-            dest = workdir / f"{ch['photo_id']}.cbz"
-            await self.storage.download(self.storage.channel, ch["msg_id"], dest)
-            cbz_files.append(str(dest))
-
-        await self._status(job, "转换 PDF", force=True)
-        authors = json.loads(album["authors"])
-        spec = {
-            "jm_id": jm_id,
-            "out_dir": str(workdir / "pdf"),
-            "name": _file_name(f"[JM{jm_id}] {clip(album['title'], 80)}"),
-            "title": album["title"], "author": ", ".join(authors),
-            "quality": self.cfg.pdf_quality, "volume_bytes": self.cfg.pdf_volume_mb * 1024 * 1024,
-            "cbz": cbz_files,
-        }
-        spec_path = workdir / "pdf.json"
-        spec_path.write_text(json.dumps(spec, ensure_ascii=False))
-        result = json.loads(await self._run_module(["jmshelf.pdf", str(spec_path)], cwd=workdir, timeout=3600))
-        for f in cbz_files:
-            Path(f).unlink(missing_ok=True)
-
-        thumb = await self.ensure_cover(jm_id)
         volumes = result["volumes"]
         msg_ids, shas, total_size = [], [], 0
         for k, vol in enumerate(volumes, 1):
             path = Path(vol["path"])
             size = path.stat().st_size
-            sha = await asyncio.to_thread(pack.file_sha256, path)
+            sha = await asyncio.to_thread(images.file_sha256, path)
             label = f"卷 {k}/{len(volumes)}，" if len(volumes) > 1 else ""
             detail = (f"PDF · {len(chapters)} 章 · {vol['pages']} 页 · {size_text(size)}"
                       + (f" · 卷 {k}/{len(volumes)}" if len(volumes) > 1 else ""))
+            span = (0.8 + 0.2 * (k - 1) / len(volumes), 0.8 + 0.2 * k / len(volumes))
             msg = await self.storage.send_document(
                 self.storage.fav_channel, path, self._caption(album["title"], jm_id, detail),
                 path.name, thumb=thumb, buttons=self._read_button(f"a{jm_id}"),
-                progress=self._progress(job, label))
+                progress=self._progress(job, label, span))
             msg_ids.append(msg.id)
             shas.append(sha)
             total_size += size
             path.unlink(missing_ok=True)
-        self.db.add_pdf_record(jm_id, msg_ids, total_size, ",".join(shas), job["user_id"])
+        self.db.add_pick(jm_id, msg_ids, total_size, ",".join(shas), job["user_id"])
         self.save_meta(jm_id)
         link = self.storage.post_link(self.storage.fav_channel_id, msg_ids[0])
         await self._status(job, f"完成，PDF {size_text(total_size)}", force=True,
-                           buttons=[[Button.url("查看 PDF", link)]])
+                           buttons=[[Button.url("查看精选", link)]])
 
-    # ---- 删除 ----
-    async def remove_album(self, jm_id: int) -> tuple[int, int]:
-        lib, pdf = self.db.remove_album(jm_id)
-        await self.storage.delete(self.storage.channel, lib)
-        await self.storage.delete(self.storage.fav_channel, pdf)
-        for name in (f"{jm_id}.jpg", f"{jm_id}_thumb.jpg"):
-            (self.cfg.cover_dir / name).unlink(missing_ok=True)
+    # ---- 删除精选 ----
+    async def remove_pick(self, jm_id: int) -> tuple[int, list[str]]:
+        """删除精选记录和帖子。返回 (删掉的帖子数, Bot 删不掉、需要手动删的帖子链接)。
+
+        Telegram 不允许 Bot 删除 48 小时以前的频道消息，这些帖子只能在频道里手动删。
+        """
+        msg_ids = self.db.remove_pick(jm_id)
         self.save_meta(jm_id)
-        return len(lib), len(pdf)
+        deleted, manual = 0, []
+        for mid in msg_ids:
+            try:
+                await self.storage.delete(self.storage.fav_channel, [mid])
+                deleted += 1
+            except MessageDeleteForbiddenError:
+                manual.append(self.storage.post_link(self.storage.fav_channel_id, mid))
+        return deleted, manual
 
     # ---- JM 收藏夹同步 ----
-    async def jm_sync(self, user_id: int, data: dict | None = None) -> tuple[dict, int | None]:
-        """把 JM 收藏夹镜像成本地收藏夹，并为新收藏的作品安排入库和 PDF。"""
+    async def jm_sync(self, user_id: int, data: dict | None = None) -> dict:
+        """把 JM 收藏夹镜像成本地收藏夹；新出现的作品在后台补元数据和封面。"""
         if data is None:
             data = await self.jm.favorites(self.cfg.jm_username, self.cfg.jm_password)
         plan = sync.apply(self.db, user_id, data)
+        for jm_id in plan["new"]:
+            self.remember(jm_id)
         for jm_id in plan["changed"]:
             self.save_meta(jm_id)
-        batch = await self.start_batch(user_id, "JM 收藏夹同步", plan["archive"], plan["pdf"])
         self.db.set_meta("jmsync_at", str(int(time.time())))
-        return plan, batch
+        return plan
 
     async def _sync_loop(self):
         while True:
@@ -439,7 +453,7 @@ class Worker:
             if time.time() - int(self.db.get_meta("jmsync_at", "0")) < SYNC_INTERVAL:
                 continue
             try:
-                plan, _ = await self.jm_sync(self.cfg.owner_id)
+                plan = await self.jm_sync(self.cfg.owner_id)
                 log.info("JM 收藏夹自动同步：%s", sync.summary_counts(plan))
             except Exception as e:
                 log.exception("JM 收藏夹自动同步失败")
@@ -448,40 +462,3 @@ class Worker:
                     await self.client.send_message(self.cfg.owner_id, f"JM 收藏夹自动同步失败：{clip(str(e), 200)}")
                 except Exception:
                     pass
-
-    # ---- 备份 ----
-    async def _backup_loop(self):
-        while True:
-            last = int(self.db.get_meta("backup_at", "0"))
-            wait = last + BACKUP_INTERVAL - time.time()
-            if wait > 0:
-                await asyncio.sleep(min(wait, 3600))
-                continue
-            try:
-                await self.backup()
-            except Exception:
-                log.exception("数据库备份失败")
-                await asyncio.sleep(3600)
-
-    async def backup(self):
-        stamp = datetime.now().strftime("%Y%m%d-%H%M")
-        snap = self.cfg.work_dir / "backup.db"
-        gz = self.cfg.work_dir / f"jmshelf-{stamp}.db.gz"
-        try:
-            self.db.backup_to(snap)
-            await asyncio.to_thread(self._gzip, snap, gz)
-            msg = await self.storage.send_document(
-                self.storage.channel, gz, f"#backup 数据库备份 {stamp}", gz.name, silent=True)
-        finally:
-            snap.unlink(missing_ok=True)
-            gz.unlink(missing_ok=True)
-        ids = json.loads(self.db.get_meta("backup_msgs", "[]")) + [msg.id]
-        await self.storage.delete(self.storage.channel, ids[:-BACKUP_KEEP])
-        self.db.set_meta("backup_msgs", json.dumps(ids[-BACKUP_KEEP:]))
-        self.db.set_meta("backup_at", str(int(time.time())))
-        log.info("数据库已备份到频道消息 %s", msg.id)
-
-    @staticmethod
-    def _gzip(src: Path, dest: Path):
-        with open(src, "rb") as f, gzip.open(dest, "wb") as g:
-            shutil.copyfileobj(f, g)

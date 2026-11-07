@@ -15,9 +15,12 @@ Restart=on-failure
 RestartSec=10
 TimeoutStopSec=20
 
-# 下载子进程峰值约 300MB，主进程约 150MB，本机可用内存约 1GB
+# 主进程约 100–150MB；上传精选时生成 PDF 的子进程按卷处理，峰值约 300MB
 MemoryHigh=700M
 MemoryMax=900M
+
+# 统计服务（含子进程）的入站和出站流量，Bot 的 /status 里显示
+IPAccounting=yes
 
 NoNewPrivileges=yes
 ProtectSystem=strict

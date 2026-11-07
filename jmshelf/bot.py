@@ -1,12 +1,15 @@
-"""Bot 私聊：搜索、作品详情（带封面）、入库、收藏、批量、JM 收藏夹同步、任务、状态、用户管理。
-只响应白名单用户。"""
+"""Bot 私聊：搜索、作品详情（带封面）、收藏、上传精选、JM 收藏夹同步、任务、状态、用户管理。
+只响应白名单用户。高级搜索和阅读都在 Mini App（书架）里，Bot 保留快捷功能。"""
 import importlib.metadata
 import json
 import logging
 import shutil
+import subprocess
 import time
+from urllib.parse import quote
 
 from telethon import Button, events, functions, types
+from telethon.errors import MessageNotModifiedError
 
 from . import ids, sync, ui
 from .fmt import clip, esc, size_text, text_table
@@ -14,16 +17,19 @@ from .fmt import clip, esc, size_text, text_table
 log = logging.getLogger(__name__)
 
 PER_VIEW = 10
-ALBUM_CACHE_TTL = 600
 
 HELP = """<b>JMComic 书库</b>
 
 直接发送：
-JM 号：查看详情、入库、收藏。支持 1485198、JM1485198、#JM1485198、禁漫/车号 1485198、全角数字、作品链接
-多个 JM 号（空格、逗号或换行隔开）：批量入库或收藏
+JM 号：查看详情、在线阅读、收藏。支持 1485198、JM1485198、#JM1485198、禁漫/车号 1485198、全角数字、作品链接
+多个 JM 号（空格、逗号或换行隔开）：一起收藏
 其他文字：按关键词搜索
+/author 作者名：按作者搜索（作品详情里也可以直接点作者）
+更多搜索方式（作品、标签、角色、排序、排行榜、分类浏览）在书架的“搜索”页
 
-收藏：作品放进收藏夹就算收藏，会自动入库并生成 PDF 发到精选频道。收藏夹在书架里管理。
+阅读：直接从 JM 取，打开就能看，不用先下载。
+收藏：作品放进收藏夹就算收藏，只是记下来，书架里能找到。收藏夹在书架里管理。
+上传精选：想在 Telegram 里长期保存、离线看的作品，在作品详情里点“上传精选”，会生成 PDF 发到精选频道。
 
 命令：
 /library  打开书架
@@ -36,7 +42,7 @@ JM 号：查看详情、入库、收藏。支持 1485198、JM1485198、#JM148519
 /users  查看用户
 /adduser 用户ID  添加用户
 /deluser 用户ID  删除用户
-/remove JM号  从书库删除一本（同时删除频道帖子）"""
+/remove JM号  删除这本的精选（精选频道里的帖子一起删）"""
 
 
 class Bot:
@@ -50,7 +56,7 @@ class Bot:
         self._searches: dict[int, dict] = {}
         self._multi: dict[int, list[int]] = {}
         self._jm_data: dict[int, dict] = {}
-        self._albums: dict[int, tuple[float, dict]] = {}
+        self._authors: dict[int, dict] = {}
         self._photos: dict[int, object] = {}
 
     def register(self):
@@ -73,12 +79,7 @@ class Bot:
         return row["role"] if row else None
 
     async def _album(self, jm_id: int, fresh: bool = False) -> dict:
-        hit = self._albums.get(jm_id)
-        if hit and not fresh and time.time() - hit[0] < ALBUM_CACHE_TTL:
-            return hit[1]
-        album = await self.jm.album(jm_id)
-        self._albums[jm_id] = (time.time(), album)
-        return album
+        return await self.jm.album(jm_id, fresh)
 
     # ---- 消息 ----
     async def on_message(self, event):
@@ -128,7 +129,19 @@ class Bot:
             if arg:
                 await self._search(event, uid, arg, 1, edit=False)
             else:
-                await event.respond("用法：/search 关键词")
+                button = ui.webapp_button(self.cfg, "打开书架搜索页", "?tab=search")
+                await event.respond("用法：/search 关键词。书架的搜索页支持按作品、作者、标签、角色搜索，还能排序、看排行榜。",
+                                    buttons=[[button]] if button else None)
+        elif cmd == "author":
+            if arg:
+                await self._author_search(event, arg)
+            else:
+                await event.respond("用法：/author 作者名")
+        elif cmd == "preview":
+            # 新版搜索页预览：只有从这个按钮打开时才用新版，平时打开书架仍是当前版本
+            button = ui.webapp_button(self.cfg, "打开新版搜索页（预览）", "?tab=search&ui=2")
+            await event.respond("新版搜索页预览。平时从“书架”菜单打开的仍是当前版本。",
+                                buttons=[[button]] if button else None)
         elif cmd == "jobs":
             text, buttons = self._jobs_view()
             await event.respond(text, parse_mode="html", buttons=buttons)
@@ -151,14 +164,14 @@ class Bot:
             await event.respond(f"已删除用户 {arg}。" if ok else "没有找到这个用户（所有者不能删除）。")
         elif cmd == "remove":
             found = ids.extract(arg)
-            album = self.db.album(found[0][1]) if found and found[0][0] == "album" else None
-            if not album:
-                await event.respond("用法：/remove JM号（只能删除已入库的作品）")
+            jm_id = found[0][1] if found and found[0][0] == "album" else None
+            if not jm_id or not self.db.pick(jm_id):
+                await event.respond("用法：/remove JM号（只能删除已上传的精选）")
                 return
-            jm_id = album["jm_id"]
+            album = self.db.album(jm_id)
             await event.respond(
-                f"确认从书库删除 JM{jm_id}？\n{esc(clip(album['title'], 120))}\n\n"
-                "书库频道和精选频道里的帖子会一起删除，无法恢复。",
+                f"确认删除 JM{jm_id} 的精选？\n{esc(clip(album['title'] if album else '', 120))}\n\n"
+                "精选频道里的 PDF 帖子会一起删除，无法恢复。收藏和阅读进度不受影响。",
                 parse_mode="html",
                 buttons=[[Button.inline("确认删除", f"rmy:{jm_id}"), Button.inline("取消", "x:0")]])
         else:
@@ -179,10 +192,10 @@ class Bot:
             return
         total = state["total"]
         views = max(1, -(-total // PER_VIEW))
-        archived = self.db.archived_ids([it["jm_id"] for it in items])
+        states = self.db.album_states(uid, [it["jm_id"] for it in items])
         lines = [f"搜索：<b>{esc(query)}</b>", f"共 {total} 条，第 {view}/{views} 页", ""]
         for i, it in enumerate(items, 1):
-            mark = "  [已入库]" if it["jm_id"] in archived else ""
+            mark = "  [已收藏]" if states[it["jm_id"]]["fav"] else ""
             lines.append(f"{i}. JM{it['jm_id']}  {esc(clip(it['title'], 60))}{mark}")
         rows = self._number_rows([it["jm_id"] for it in items])
         nav = []
@@ -192,6 +205,9 @@ class Bot:
             nav.append(Button.inline("下一页", f"sp:{view + 1}"))
         if nav:
             rows.append(nav)
+        full = ui.webapp_button(self.cfg, "在书架里搜索（可排序）", f"?search={quote(query)}")
+        if full:
+            rows.append([full])
         text = "\n".join(lines)
         if edit:
             await event.edit(text, parse_mode="html", buttons=rows)
@@ -199,14 +215,45 @@ class Bot:
             await event.respond(text, parse_mode="html", buttons=rows)
 
     @staticmethod
-    def _number_rows(jm_ids: list[int]) -> list:
-        numbers = [Button.inline(str(i), f"a:{jm_id}") for i, jm_id in enumerate(jm_ids, 1)]
+    def _number_rows(jm_ids: list[int], offset: int = 0) -> list:
+        numbers = [Button.inline(str(offset + i), f"a:{jm_id}") for i, jm_id in enumerate(jm_ids, 1)]
         return [numbers[k:k + 5] for k in range(0, len(numbers), 5)]
+
+    # ---- 按作者搜索：每次 10 条，点“加载更多”再发 10 条 ----
+    async def _author_search(self, event, name: str):
+        key = (max(self._authors) + 1) if self._authors else 1
+        self._authors[key] = {"query": name, "by": "author", "pages": {}, "total": 0, "page_size": 0,
+                              "uid": event.sender_id}
+        for old in sorted(self._authors)[:-30]:  # 只保留最近 30 次作者搜索
+            del self._authors[old]
+        text, rows = await self._author_view(key, 0, more=True)
+        await event.respond(text, parse_mode="html", buttons=rows, link_preview=False)
+
+    async def _author_view(self, key: int, start: int, more: bool):
+        state = self._authors[key]
+        items = await self._search_items(state, start, PER_VIEW)
+        name = esc(state["query"])
+        if not items:
+            return f"没有找到作者“{name}”的作品。", None
+        total = state["total"]
+        states = self.db.album_states(state.get("uid", 0), [it["jm_id"] for it in items])
+        lines = [f"作者：<b>{name}</b>，共 {total} 本（第 {start + 1}–{start + len(items)} 本）", ""]
+        for i, it in enumerate(items, start + 1):
+            mark = "  [已收藏]" if states[it["jm_id"]]["fav"] else ""
+            lines.append(f"{i}. JM{it['jm_id']}  {esc(clip(it['title'], 60))}{mark}")
+        rows = self._number_rows([it["jm_id"] for it in items], start)
+        if more and start + len(items) < total:
+            rows.append([Button.inline("加载更多", f"am:{key}:{start + len(items)}")])
+        full = ui.webapp_button(self.cfg, "在书架里搜索（可排序）", f"?search={quote(state['query'])}&by=author")
+        if start == 0 and full:
+            rows.append([full])
+        return "\n".join(lines), rows
 
     async def _search_items(self, state, start, count):
         """JM 接口一页条数较多，这里按 10 条一屏切分，并缓存已取过的接口页。"""
+        by = state.get("by", "site")
         if not state["pages"]:
-            first = await self.jm.search(state["query"], 1)
+            first = await self.jm.search(state["query"], 1, by)
             state["pages"][1] = first["items"]
             state["total"] = first["total"]
             state["page_size"] = len(first["items"]) or 1
@@ -216,7 +263,7 @@ class Bot:
         while len(result) < count and index < state["total"]:
             api_page = index // size + 1
             if api_page not in state["pages"]:
-                state["pages"][api_page] = (await self.jm.search(state["query"], api_page))["items"]
+                state["pages"][api_page] = (await self.jm.search(state["query"], api_page, by))["items"]
             items = state["pages"][api_page]
             offset = index - (api_page - 1) * size
             if offset >= len(items):
@@ -268,46 +315,24 @@ class Bot:
             if jm_id in jm_ids:
                 continue
             jm_ids.append(jm_id)
-            if self.db.fully_archived(jm_id):
-                mark = "  [已入库]"
-            elif self.db.active_job("archive", jm_id):
-                mark = "  [入库中]"
-            else:
-                mark = ""
-            if self.db.is_favorited(uid, jm_id):
-                mark += "  [已收藏]"
+            mark = "  [已收藏]" if self.db.is_favorited(uid, jm_id) else ""
+            if self.db.pick(jm_id):
+                mark += "  [已上传精选]"
             lines.append(f"{len(lines) + 1}. JM{jm_id}  {esc(clip(album['title'], 50))}{mark}")
         self._multi[uid] = jm_ids
-        todo = sum(1 for j in jm_ids if not self.db.fully_archived(j) and not self.db.active_job("archive", j))
         rows = self._number_rows(jm_ids)
-        actions = []
-        if todo:
-            actions.append(Button.inline(f"全部入库（{todo} 本）", "ba:0"))
         if jm_ids:
-            actions.append(Button.inline("全部收藏", "bf:0"))
-        if actions:
-            rows.append(actions)
+            rows.append([Button.inline("全部收藏", "bf:0")])
         await note.edit("\n".join([f"识别到 {len(found)} 个 JM 号：", ""] + lines), parse_mode="html",
                         buttons=rows or None)
 
-    async def _multi_action(self, event, uid, favorite: bool):
+    async def _multi_action(self, event, uid):
         jm_ids = self._multi.get(uid)
         if not jm_ids:
             await event.answer("列表已过期，请重新发送 JM 号", alert=True)
             return
-        if favorite:
-            folder = self.db.default_folder(uid)
-            for jm_id in jm_ids:
-                self.db.add_to_folder(folder, jm_id)
-                self.worker.save_meta(jm_id)
-            archive = [j for j in jm_ids if not self.db.fully_archived(j)]
-            pdf = [j for j in jm_ids if self.db.fully_archived(j) and not self.db.pdf_record(j)]
-            batch = await self.worker.start_batch(uid, f"批量收藏 {len(jm_ids)} 本", archive, pdf)
-            await event.answer("已全部收藏" + ("，进度见新消息" if batch else ""))
-        else:
-            archive = [j for j in jm_ids if not self.db.fully_archived(j)]
-            batch = await self.worker.start_batch(uid, f"批量入库 {len(archive)} 本", archive, [])
-            await event.answer("已加入队列，进度见新消息" if batch else "都已经入库或正在入库")
+        await self.worker.favorite_many(uid, jm_ids)
+        await event.answer(f"已全部收藏（{len(jm_ids)} 本）")
 
     # ---- JM 收藏夹同步 ----
     async def _jmsync_start(self, event, uid):
@@ -332,19 +357,33 @@ class Bot:
         p = sync.preview(self.db, data)
         lines = [f"<b>JM 收藏夹</b>：共 {p['total']} 本", ""]
         lines += [f"{esc(name)}：{count} 本" for name, count in p["folders"]]
-        minutes = round(len(p["archive"]) * 0.75)
-        lines += ["", f"同步后需要入库 {len(p['archive'])} 本" + (f"（预计约 {minutes} 分钟）" if minutes else "")
-                  + f"，生成 PDF {len(p['pdf'])} 本。",
-                  "同步只改“JM·”开头的收藏夹，不影响你自建的收藏夹，也不删除书库里的作品。"]
+        lines += ["", f"其中 {len(p['new'])} 本这边还没有记录，同步后在后台补标题和封面。",
+                  "同步只改“JM·”开头的收藏夹，不影响你自建的收藏夹和精选。收藏不会触发下载或上传。"]
         last = int(self.db.get_meta("jmsync_at", "0"))
         if last:
             lines.append("上次同步：" + time.strftime("%Y-%m-%d %H:%M", time.localtime(last)))
+        lines += ["", "反向同步：" + self._reverse_state(),
+                  "开启后，你在这边收藏作品时，会自动加进 JM 账号的收藏。只加不删；"
+                  "JM 接口只能放进默认收藏；已经在 JM 收藏里的会跳过。"]
         return "\n".join(lines)
+
+    def _reverse_state(self) -> str:
+        state = "已开启" if self.db.get_meta("jm_reverse") == "1" else "已关闭"
+        try:
+            last = json.loads(self.db.get_meta("jm_reverse_last", "{}"))
+        except ValueError:
+            last = {}
+        if last:
+            when = time.strftime("%m-%d %H:%M", time.localtime(last["at"]))
+            state += f"（最近一次 {when}：加入 {last['added']}，已存在 {last['skipped']}，失败 {last['failed']}）"
+        return state
 
     def _jmsync_buttons(self):
         auto = self.db.get_meta("jmsync_auto") == "1"
+        reverse = self.db.get_meta("jm_reverse") == "1"
         return [[Button.inline("开始同步", "js:go"), Button.inline("取消", "x:0")],
-                [Button.inline("每天自动同步：已开启（点此关闭）" if auto else "每天自动同步：已关闭（点此开启）", "js:auto")]]
+                [Button.inline("每天自动同步：已开启（点此关闭）" if auto else "每天自动同步：已关闭（点此开启）", "js:auto")],
+                [Button.inline("反向同步到 JM：已开启（点此关闭）" if reverse else "反向同步到 JM：已关闭（点此开启）", "js:rev")]]
 
     # ---- 任务 / 用户 / 状态 ----
     def _jobs_view(self):
@@ -373,18 +412,27 @@ class Bot:
             except importlib.metadata.PackageNotFoundError:
                 return "-"
 
-        cache = sum(p.stat().st_size for p in self.cfg.cache_dir.rglob("*") if p.is_file())
+        cache = self.worker.cache
+        used, chapters = cache.usage()
         meta_dir = self.cfg.data_dir / "meta"
         rows = [
             ["jmcomic", version("jmcomic")],
             ["telethon", version("telethon")],
             ["disk free", size_text(shutil.disk_usage(self.cfg.data_dir).free)],
-            ["page cache", size_text(cache)],
-            ["albums", len(self.db.albums(self.cfg.owner_id))],
+            ["cache", f"{size_text(used)} / {size_text(cache.max_bytes)}"],
+            ["cached chapters", chapters],
+            ["from JM (since start)", size_text(cache.downloaded_bytes)],
+            ["shelf", len(self.db.shelf(self.cfg.owner_id))],
+            ["picks", self.db.conn.execute("SELECT COUNT(*) FROM picks").fetchone()[0]],
             ["meta files", len(list(meta_dir.glob("JM*.json"))) if meta_dir.exists() else 0],
             ["queue", self.db.queued_count()],
         ]
+        traffic = self._traffic()
+        if traffic:
+            rows += [["traffic in", size_text(traffic[0])], ["traffic out", size_text(traffic[1])]]
         lines = ["<b>运行状态</b>", text_table(["ITEM", "VALUE"], rows, right={1})]
+        if traffic:
+            lines.append("流量是服务这次启动以来的累计（systemd IPAccounting，含子进程）。")
         status_file = self.cfg.data_dir / "update-status.json"
         if status_file.exists():
             try:
@@ -398,9 +446,21 @@ class Bot:
         if self.cfg.jm_username:
             auto = "已开启" if self.db.get_meta("jmsync_auto") == "1" else "已关闭"
             lines.append(f"JM 收藏夹同步：已配置账号，每天自动同步{auto}。")
+            lines.append("反向同步到 JM：" + esc(self._reverse_state()) + "。")
         else:
             lines.append("JM 收藏夹同步：未配置账号。")
         return "\n".join(lines)
+
+    @staticmethod
+    def _traffic() -> tuple[int, int] | None:
+        """服务启动以来的入站、出站字节数（systemd IPAccounting）；拿不到时返回 None。"""
+        try:
+            out = subprocess.run(["systemctl", "show", "jmcomic", "-p", "IPIngressBytes", "-p", "IPEgressBytes"],
+                                 capture_output=True, text=True, timeout=3).stdout
+            values = dict(line.split("=", 1) for line in out.strip().splitlines() if "=" in line)
+            return int(values["IPIngressBytes"]), int(values["IPEgressBytes"])
+        except (OSError, subprocess.SubprocessError, KeyError, ValueError):
+            return None
 
     # ---- 按钮 ----
     async def on_callback(self, event):
@@ -424,24 +484,39 @@ class Bot:
                     return
                 await event.answer()
                 await self._search(event, uid, state["query"], int(arg), edit=True)
-            elif kind == "ar":
-                status, _ = await self.worker.submit("archive", int(arg), uid)
-                await event.answer("已加入队列" if status == "created" else "已经在队列里了")
+            elif kind == "au":
+                jm_id, _, index = arg.partition(":")
+                album = await self._album(int(jm_id))
+                await event.answer()
+                await self._author_search(event, album["authors"][int(index)])
+            elif kind == "am":
+                key, _, start = arg.partition(":")
+                if int(key) not in self._authors:
+                    await event.answer("列表已过期，请重新搜索作者", alert=True)
+                    return
+                start = int(start)
+                # 旧消息按原样重写，只去掉“加载更多”，再发一条新消息放接下来的 10 条
+                text, rows = await self._author_view(int(key), start - PER_VIEW, more=False)
+                await event.edit(text, parse_mode="html", buttons=rows, link_preview=False)
+                await event.answer()
+                text, rows = await self._author_view(int(key), start, more=True)
+                await event.respond(text, parse_mode="html", buttons=rows, link_preview=False)
+            elif kind == "pb":
+                result = await self.worker.publish(uid, int(arg))
+                await event.answer({"created": "已加入队列，进度见新消息", "exists": "已经在队列里了"}.get(
+                    result, "已经上传过了"))
                 await self._refresh_album(event, int(arg), uid)
             elif kind == "fv":
-                result = await self.worker.favorite(uid, int(arg))
-                await event.answer({"archive": "已收藏，正在入库，完成后自动生成 PDF",
-                                    "pdf": "已收藏，正在生成 PDF"}.get(result, "已收藏"))
+                await self.worker.favorite(uid, int(arg))
+                await event.answer("已收藏")
                 await self._refresh_album(event, int(arg), uid)
             elif kind == "uf":
                 self.db.unfavorite(uid, int(arg))
                 self.worker.save_meta(int(arg))
-                await event.answer("已取消收藏。精选频道里的 PDF 保留不删", alert=True)
+                await event.answer("已取消收藏。精选不受影响")
                 await self._refresh_album(event, int(arg), uid)
-            elif kind == "ba":
-                await self._multi_action(event, uid, favorite=False)
             elif kind == "bf":
-                await self._multi_action(event, uid, favorite=True)
+                await self._multi_action(event, uid)
             elif kind == "js" and role == "owner":
                 await self._jmsync_callback(event, uid, arg)
             elif kind == "jobs":
@@ -449,23 +524,30 @@ class Bot:
                 await event.edit(text, parse_mode="html", buttons=buttons)
                 await event.answer("已刷新")
             elif kind == "rmy" and role == "owner":
-                lib, pdf = await self.worker.remove_album(int(arg))
-                await event.edit(f"已删除 JM{arg}：书库帖子 {lib} 条，PDF 帖子 {pdf} 条。")
+                deleted, manual = await self.worker.remove_pick(int(arg))
+                text = f"已删除 JM{arg} 的精选记录，删掉帖子 {deleted} 条。"
+                if manual:
+                    text += ("\nTelegram 不允许 Bot 删除 48 小时以前的频道消息，下面这些帖子请在精选频道里手动删除：\n"
+                             + "\n".join(manual))
+                await event.edit(text, link_preview=False)
                 await event.answer()
             elif kind == "x":
                 await event.edit("已取消。")
                 await event.answer()
             else:
                 await event.answer()
+        except MessageNotModifiedError:
+            await event.answer("已是最新")
         except Exception as e:
             log.exception("处理按钮失败")
             await event.answer(f"出错了：{clip(str(e) or type(e).__name__, 150)}", alert=True)
 
     async def _jmsync_callback(self, event, uid, arg):
-        if arg == "auto":
-            on = self.db.get_meta("jmsync_auto") != "1"
-            self.db.set_meta("jmsync_auto", "1" if on else "0")
-            await event.answer("已开启每天自动同步" if on else "已关闭每天自动同步")
+        if arg in ("auto", "rev"):
+            key, name = ("jmsync_auto", "每天自动同步") if arg == "auto" else ("jm_reverse", "反向同步到 JM")
+            on = self.db.get_meta(key) != "1"
+            self.db.set_meta(key, "1" if on else "0")
+            await event.answer(f"已开启{name}" if on else f"已关闭{name}")
             data = self._jm_data.get(uid)
             if data:
                 await event.edit(self._jmsync_text(data), parse_mode="html", buttons=self._jmsync_buttons())
@@ -475,5 +557,5 @@ class Bot:
             await event.answer("数据已过期，请重新发送 /jmsync", alert=True)
             return
         await event.answer("开始同步")
-        plan, batch = await self.worker.jm_sync(uid, data)
-        await event.edit("同步完成：" + sync.summary_counts(plan) + ("。入库和 PDF 进度见新消息。" if batch else "。"))
+        plan = await self.worker.jm_sync(uid, data)
+        await event.edit("同步完成：" + sync.summary_counts(plan) + "。新作品的标题和封面在后台补上。")

@@ -74,13 +74,14 @@ body.reading { background: #000; }
   content: attr(data-n); position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   color: #444; font-size: 28px;
 }
-.reader .pg img { position: relative; display: block; width: 100%; height: 100%; }
+.reader .pg img, .reader .pg canvas { position: relative; display: block; width: 100%; height: 100%; }
+.reader .pg.failed::before { content: '第 ' attr(data-n) ' 页加载失败，点这里重试'; font-size: 15px; color: #888; }
 .reader .end { padding: 32px 16px 64px; text-align: center; color: #aaa; }
 .reader .end button { margin-top: 14px; }
 
 .reader.page-mode { height: 100vh; overflow: hidden; touch-action: pan-y; }
 .stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
-.stage img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.stage img, .stage canvas { max-width: 100%; max-height: 100%; object-fit: contain; }
 
 .hud {
   position: fixed; left: 0; right: 0; z-index: 10; display: flex; align-items: center; gap: 10px;
@@ -94,6 +95,24 @@ body.reading { background: #000; }
 .hud button:disabled { opacity: .35; }
 .reader.hud-hidden .hud.top { transform: translateY(-110%); }
 .reader.hud-hidden .hud.bottom { transform: translateY(110%); }
+
+/* 右侧进度条（scrubber.js）：平时隐藏且不拦截触摸，滚动或打开工具栏时出现 */
+.scrub {
+  position: fixed; right: 0; top: calc(64px + env(safe-area-inset-top)); bottom: calc(76px + env(safe-area-inset-bottom));
+  width: 40px; z-index: 9; opacity: 0; pointer-events: none; transition: opacity .25s; touch-action: none;
+}
+.scrub.on { opacity: 1; pointer-events: auto; }
+.scrub .track { position: absolute; right: 12px; top: 0; bottom: 0; width: 4px; border-radius: 2px; background: rgba(255, 255, 255, .28); }
+.scrub .thumb {
+  position: absolute; left: 50%; width: 16px; height: 40px; margin: -20px 0 0 -8px; border-radius: 8px;
+  background: rgba(255, 255, 255, .92); box-shadow: 0 1px 6px rgba(0, 0, 0, .6);
+}
+.scrub.dragging .thumb { background: #fff; transform: scale(1.15); }
+.scrub .bubble {
+  position: absolute; right: 40px; transform: translateY(-50%); display: none; padding: 6px 12px; border-radius: 10px;
+  background: rgba(0, 0, 0, .85); color: #fff; font-size: 15px; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.scrub.dragging .bubble { display: block; }
 
 #toast {
   position: fixed; left: 50%; bottom: calc(28px + env(safe-area-inset-bottom)); transform: translateX(-50%);
@@ -134,3 +153,89 @@ body.reading { background: #000; }
 .check { display: flex; gap: 10px; align-items: center; padding: 11px 14px; }
 .check + .check { border-top: 1px solid rgba(127, 127, 127, .15); }
 .check input { width: 18px; height: 18px; accent-color: var(--btn); }
+
+/* 顶部标签 */
+.tabs {
+  position: sticky; top: 0; z-index: 20; display: flex; background: var(--bg);
+  border-bottom: 1px solid rgba(127, 127, 127, .18);
+}
+.tabs button { flex: 1; padding: 12px 0 10px; background: transparent; color: var(--hint); font-size: 15px; border-bottom: 2px solid transparent; }
+.tabs button.on { color: var(--text); font-weight: 600; border-bottom-color: var(--btn); }
+.sub { padding: 0 12px; font-size: 12px; color: var(--hint); text-align: right; }
+.seg { margin-top: 10px; }
+.cover .badge.right { left: auto; right: 6px; }
+
+/* 搜索 */
+.searchbar { display: flex; gap: 8px; align-items: flex-start; padding: 12px 12px 4px; }
+.search-input { resize: none; min-height: 40px; max-height: 120px; line-height: 1.4; }
+.search-info { padding: 0 12px; margin: 6px 0; }
+.bulk { padding-top: 2px; }
+.chapter-row { padding: 12px 14px; }
+
+/* 任务 */
+.jobs-head { padding: 10px 12px 0; margin: 0 0 8px; }
+.jobs { margin: 0 12px 24px; }
+.job { display: flex; gap: 10px; align-items: center; padding: 11px 14px; }
+.job .grow { flex: 1; min-width: 0; }
+.job-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: none; }
+.clip { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.err { color: #d93025; }
+.pill { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--bg); color: var(--hint); }
+.pill.running { background: var(--btn); color: var(--btn-text); }
+.pill.failed { color: #d93025; }
+.pill.done { color: var(--hint); }
+
+/* 作者搜索 */
+.link { color: var(--link); }
+
+/* 搜索方式下拉、清空按钮、筛选、发现 */
+.searchbar { align-items: center; }
+.by-select {
+  flex: none; height: 40px; padding: 0 28px 0 12px; border-radius: 8px; font: inherit; font-size: 14px;
+  border: 1px solid rgba(127, 127, 127, .3); background-color: var(--bg2); color: var(--text);
+  -webkit-appearance: none; appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 15px) 18px, calc(100% - 10px) 18px;
+  background-size: 5px 5px; background-repeat: no-repeat;
+}
+.input-wrap { position: relative; flex: 1; min-width: 0; display: flex; }
+.input-wrap .search-input { padding-right: 32px; }
+.clear-btn {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%); width: 24px; height: 24px;
+  border-radius: 12px; background: rgba(127, 127, 127, .25); color: var(--bg); font-size: 16px; line-height: 24px; padding: 0;
+}
+.filters { padding: 2px 0 0; }
+.filters .chips, .discover .chips { padding-bottom: 8px; }
+.discover { padding-top: 6px; }
+.discover h3 { font-size: 13px; color: var(--hint); font-weight: 500; margin: 8px 12px 6px; }
+
+.grid.busy { opacity: .45; pointer-events: none; transition: opacity .15s; }
+
+/* 新版搜索页：分类、排序两个下拉 */
+.pills { display: flex; gap: 8px; padding: 2px 12px 0; }
+.pill-select {
+  height: 34px; padding: 0 28px 0 12px; border-radius: 17px; font: inherit; font-size: 13px;
+  border: 0; background-color: var(--bg2); color: var(--text);
+  -webkit-appearance: none; appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 15px) 15px, calc(100% - 10px) 15px;
+  background-size: 5px 5px; background-repeat: no-repeat;
+}
+
+/* 入库进度条 */
+.progress-box { display: flex; flex-direction: column; gap: 6px; }
+.progress-btn {
+  position: relative; overflow: hidden; width: 100%; padding: 12px; border-radius: var(--radius);
+  font-size: 15px; font-weight: 600; background: var(--bg2); color: var(--text);
+}
+.progress-btn:disabled { opacity: 1; cursor: default; }
+.progress-btn .bar {
+  position: absolute; left: 0; top: 0; bottom: 0; width: var(--p, 0%);
+  background: var(--btn); opacity: .35; transition: width .8s ease;
+}
+.progress-btn.queued .bar { width: 100%; opacity: .12; animation: jm-pulse 1.6s ease-in-out infinite; }
+.progress-btn .label { position: relative; }
+.progress-text { margin: 0; }
+@keyframes jm-pulse { 50% { opacity: .28; } }
+.mini-bar { position: relative; height: 3px; margin-top: 6px; border-radius: 2px; overflow: hidden; background: rgba(127, 127, 127, .2); }
+.mini-bar::after { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: var(--p, 0%); background: var(--btn); }
