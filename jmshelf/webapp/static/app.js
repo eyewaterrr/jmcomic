@@ -981,7 +981,14 @@
       el('button', { disabled: !c.prev, onclick: () => go(`#/r/${c.prev}`) }, '上一章'),
       el('button', { onclick: () => switchMode() }, mode === 'scroll' ? '切换为翻页' : '切换为滑动'),
       el('button', { disabled: !c.next, onclick: () => go(`#/r/${c.next}`) }, '下一章'));
-    const toggleHud = () => root.classList.toggle('hud-hidden');
+    // 右侧进度条：拖动或点轨道跳页（scrubber.js）；跳页的具体做法两种模式不同，下面各自设置 seek
+    let seek = () => {};
+    const scrub = makeScrubber({ total, onSeek: (n) => seek(n) });
+    scrub.set(current);
+    const toggleHud = () => {
+      root.classList.toggle('hud-hidden');
+      scrub.pin(!root.classList.contains('hud-hidden'));
+    };
 
     const save = (keepalive = false) => {
       if (current === saved) return;
@@ -996,6 +1003,7 @@
       if (n === current && saved) return;
       current = n;
       counter.textContent = `${n} / ${total}`;
+      scrub.set(n);
       history.replaceState(null, '', `#/r/${photo}/${n}`);
       clearTimeout(saveTimer);
       saveTimer = setTimeout(save, 1200);
@@ -1020,8 +1028,12 @@
         c.next
           ? el('button', { class: 'primary', onclick: () => go(`#/r/${c.next}`) }, '下一章')
           : el('button', { class: 'secondary', onclick: () => go(S.parent) }, '返回作品'));
-      root.append(top, list, end, bottom);
+      root.append(top, list, end, bottom, scrub.el);
       app.replaceChildren(root);
+      seek = (n) => {
+        list.children[n - 1].scrollIntoView({ block: 'start' });
+        setCurrent(n);
+      };
 
       // 画好的页只保留屏幕附近的（上下各约 3 屏），离远了就释放 Canvas，长篇也不会占满手机内存
       const shown = new Map();
@@ -1072,6 +1084,7 @@
 
       let ticking = false;
       const onScroll = () => {
+        scrub.show();
         if (ticking) return;
         ticking = true;
         requestAnimationFrame(() => {
@@ -1093,7 +1106,7 @@
       };
     } else {
       const stage = el('div', { class: 'stage' });
-      root.append(stage, top, bottom);
+      root.append(stage, top, bottom, scrub.el);
       app.replaceChildren(root);
 
       let showing = null;
@@ -1152,6 +1165,7 @@
         else if (e.key === 'ArrowLeft') prev();
       };
       document.addEventListener('keydown', onKey);
+      seek = (n) => show(n);
       teardown = () => {
         document.removeEventListener('keydown', onKey);
         ticket++;

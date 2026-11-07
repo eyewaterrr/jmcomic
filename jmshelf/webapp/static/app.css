@@ -96,6 +96,24 @@ body.reading { background: #000; }
 .reader.hud-hidden .hud.top { transform: translateY(-110%); }
 .reader.hud-hidden .hud.bottom { transform: translateY(110%); }
 
+/* 右侧进度条（scrubber.js）：平时隐藏且不拦截触摸，滚动或打开工具栏时出现 */
+.scrub {
+  position: fixed; right: 0; top: calc(64px + env(safe-area-inset-top)); bottom: calc(76px + env(safe-area-inset-bottom));
+  width: 40px; z-index: 9; opacity: 0; pointer-events: none; transition: opacity .25s; touch-action: none;
+}
+.scrub.on { opacity: 1; pointer-events: auto; }
+.scrub .track { position: absolute; right: 12px; top: 0; bottom: 0; width: 4px; border-radius: 2px; background: rgba(255, 255, 255, .28); }
+.scrub .thumb {
+  position: absolute; left: 50%; width: 16px; height: 40px; margin: -20px 0 0 -8px; border-radius: 8px;
+  background: rgba(255, 255, 255, .92); box-shadow: 0 1px 6px rgba(0, 0, 0, .6);
+}
+.scrub.dragging .thumb { background: #fff; transform: scale(1.15); }
+.scrub .bubble {
+  position: absolute; right: 40px; transform: translateY(-50%); display: none; padding: 6px 12px; border-radius: 10px;
+  background: rgba(0, 0, 0, .85); color: #fff; font-size: 15px; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.scrub.dragging .bubble { display: block; }
+
 #toast {
   position: fixed; left: 50%; bottom: calc(28px + env(safe-area-inset-bottom)); transform: translateX(-50%);
   max-width: 86vw; padding: 9px 14px; border-radius: 8px; background: rgba(0, 0, 0, .82); color: #fff;
